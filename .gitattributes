@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.bmp binary
+*.png binary
+*.pdf binary
+*.ps1 text eol=crlf
+crates/paperback-rs/tests/fixtures/** -text

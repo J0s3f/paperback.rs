@@ -1,0 +1,40 @@
+[workspace]
+resolver = "3"
+members = ["crates/paperback-rs", "crates/paperback-rs-cli"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+homepage = "https://paperback.j0s.at"
+repository = "https://github.com/J0s3f/paperback.rs"
+authors = ["Josef H.B. Schneider"]
+keywords = ["backup", "paper", "archive", "reed-solomon", "cli"]
+readme = "README.md"
+rust-version = "1.92"
+
+[profile.dev]
+opt-level = 2
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_lifetimes = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Failures from outside input are errors, never panics (tests may unwrap, see clippy.toml).
+unwrap_used = "deny"
+expect_used = "deny"
+# Pixel and block arithmetic is bounded by the checked picture sizes; the casts are deliberate.
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+module_name_repetitions = "allow"
