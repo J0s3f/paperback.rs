@@ -1,0 +1,3 @@
+target/
+*.log
+crates/paperback-rs/tests/fixtures/realworld/evaluate/

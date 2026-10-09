@@ -1,0 +1,111 @@
+name: release
+
+# A tag such as 1.0 or v1.0.0 runs the tests, builds the command-line tool for
+# Windows, Linux and macOS and attaches the archives to a GitHub release.
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+*"
+      - "v[0-9]+.[0-9]+*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      checks: write
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked -p paperback-rs-cli --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="paperback-rs-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          exe=paperback-rs
+          if [ "${{ matrix.archive }}" = zip ]; then exe=paperback-rs.exe; fi
+          cp "target/${{ matrix.target }}/release/$exe" "$name/"
+          cp README.md LICENSE NOTICE.md CHANGELOG.md "$name/"
+          if [ "${{ matrix.archive }}" = zip ]; then
+            7z a "$name.zip" "$name" > /dev/null
+          else
+            tar -czf "$name.tar.gz" "$name"
+          fi
+          ls -l "$name".*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            paperback-rs-*.zip
+            paperback-rs-*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum paperback-rs-* > SHA256SUMS
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          notes=$(mktemp)
+          # The notes are the changelog section of this version.
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            /^## / { if (found) exit; found = ($2 == v || $2 == v ".0") ; next }
+            found { print }
+          ' CHANGELOG.md > "$notes"
+          if [ ! -s "$notes" ]; then echo "paperback.rs $GITHUB_REF_NAME" > "$notes"; fi
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "paperback.rs $GITHUB_REF_NAME" \
+            --notes-file "$notes" \
+            --verify-tag
