@@ -18,6 +18,8 @@ Described from the user's point of view.
   stored unpacked.
 - A password (`--password-file`, `--password-env`) encrypts the data.
 - The input name and modification time are stored on the pages and restored in `--json` output.
+- Pages carry a SHA-256 of the file and an identifier and layout for each sheet, in a form that PaperBack 1.00 and 1.10
+  ignore (`docs/format.md`, "Extension records"). `--no-extensions` leaves them out.
 - Every page has a title (name, date, size, page x of y) above the dots and a hint (recommended scanner resolution,
   how to restore) below; `--no-text` omits them.
 
@@ -36,6 +38,10 @@ Described from the user's point of view.
 - With `-v`, a page that read badly is followed by hints on likely causes: fewer than 2.5 pixels per dot, a scan that
   is pure black and white, stretched contrast or bright halos from sharpening. `--json` lists them as `hints`. Without
   `-v` or `--json` nothing is analysed and nothing is printed.
+- When the pages carry a SHA-256 the restored file is compared with it; a difference is an error (exit 3) and `-v`
+  reports a match. Pictures of one sheet are matched by their identifier as well as by block addresses. `--json` lists `integrity`, the sheet identifiers and `misplaced_blocks`.
+- Pages written by paperback.rs tell their layout, so a block read in a cell where it does not belong is dropped
+  instead of trusted (`-v` counts them).
 - Pages that cannot be read are reported with `-v` and skipped; the file is restored if the
   remaining pages carry everything.
 - If blocks are missing, the error lists the pages to scan again.

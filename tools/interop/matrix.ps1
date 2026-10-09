@@ -32,7 +32,13 @@ function Run-Auto([string[]]$autoArgs) {
   & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $here 'drive-original.ps1') -Exe $exe @autoArgs 2>&1 | Out-Null
   return $LASTEXITCODE
 }
-function Same($a, $b) { (Test-Path $a) -and (Test-Path $b) -and ((Get-FileHash $a).Hash -eq (Get-FileHash $b).Hash) }
+# Compares the contents of two files. The hash is computed here rather than by Get-FileHash, which is
+# missing when the module path of a parent PowerShell leaks into a child.
+function Sha256Of($path) {
+  $sha = [Security.Cryptography.SHA256]::Create(); $stream = [IO.File]::OpenRead($path)
+  try { return [BitConverter]::ToString($sha.ComputeHash($stream)) } finally { $stream.Dispose(); $sha.Dispose() }
+}
+function Same($a, $b) { (Test-Path $a) -and (Test-Path $b) -and ((Sha256Of $a) -eq (Sha256Of $b)) }
 
 $cases = @(
   @{ Name = 'text';         File = $text;   Compression = 2; Password = '' },
@@ -61,15 +67,20 @@ foreach ($c in $cases) {
   Get-ChildItem $out -Filter "w-$tag*" -ErrorAction SilentlyContinue | ForEach-Object { $_.Delete() }
   $encArgs = @('encode', $c.File, '-o', "$out\w-$tag-%02d.bmp", '--printer-dpi', '300', '--dot-dpi', '200',
                '--compression', @('none', 'fast', 'max')[$c.Compression])
-  if ($c.Password) { $env:PB_TEST_PW = $c.Password; $encArgs += @('--password-env', 'PB_TEST_PW') }
+  $pwArgsOwn = @()
+  if ($c.Password) { $env:PB_TEST_PW = $c.Password; $encArgs += @('--password-env', 'PB_TEST_PW'); $pwArgsOwn = @('--password-env', 'PB_TEST_PW') }
   & $pb @encArgs 2>&1 | Out-Null
   $encExit = $LASTEXITCODE
   $ours = @(Get-ChildItem $out -Filter "w-$tag-*.bmp" | Sort-Object Name | ForEach-Object FullName)
+  # The pages written here carry a SHA-256 and a sheet identifier that the originals must not notice;
+  # this program must find them again.
+  $checked = & $pb decode @($ours) -v -o "$out\w-$tag.own" @($pwArgsOwn) 2>&1 | Out-String
+  $results += [pscustomobject]@{ Original = $Label; Case = $tag; Direction = 'paperback.rs -> paperback.rs (hash)'; Pass = ($checked -match 'matches the SHA-256' -and (Same $c.File "$out\w-$tag.own")); Note = 'extension records read back' }
   $restored = "$out\w-$tag.restored"
   if (Test-Path $restored) { [IO.File]::Delete($restored) }
   $code = Run-Auto @('-Action', 'open', '-InputList', ($ours -join '|'), '-OutputPath', $restored, '-Password', $pass, '-TimeoutSec', 150)
   $results += [pscustomobject]@{ Original = $Label; Case = $tag; Direction = 'paperback.rs -> original'; Pass = ($(if ($Legacy -and $c.Password) { -not (Same $c.File $restored) } else { Same $c.File $restored })); Note = "paperback.rs exit $encExit, $($ours.Count) page(s), original exit $code" }
 }
-$results | Format-Table -AutoSize | Out-String -Width 200
+$results | Select-Object Original, Case, Direction, @{ n = 'Result'; e = { if ($_.Pass) { 'PASS' } else { 'FAIL' } } }, Note | Format-Table -AutoSize | Out-String -Width 200
 if ($results | Where-Object { -not $_.Pass }) { exit 1 }
 

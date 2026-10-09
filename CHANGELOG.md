@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.0
+
+- Pages carry a SHA-256 of the file and an identifier and layout for each sheet, in records that PaperBack 1.00 and
+  1.10 ignore. The restored file is checked against the hash; `--no-extensions` leaves the records out.
+- Blocks read in a cell where the page's layout does not put them are dropped.
+- The sheet identifier helps to match pictures of one sheet: a picture showing another identifier is never taken for a
+  known sheet, and one showing the same needs fewer agreeing blocks. The corners are looked at for it when the middle of a
+  picture matches no sheet.
+- The records sit in the first and last three cells of a page with a third, parity record; any one of the three can be lost.
+  A page holds six cells less. Tested with damaged record cells and with 1.1 reading the new pages.
+
 ## 1.1.0
 
 - Blocks that do not read are repaired a second time with the least certain bytes treated as erasures, which reads

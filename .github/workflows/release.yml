@@ -97,6 +97,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # A tag moved after its release was made (for a documentation fix, say) keeps that release
+          # with its files; a release is made once.
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            echo "the release $GITHUB_REF_NAME exists already and is kept"
+            exit 0
+          fi
           notes=$(mktemp)
           # The notes are the changelog section of this version.
           version="${GITHUB_REF_NAME#v}"

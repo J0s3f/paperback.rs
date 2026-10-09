@@ -6,13 +6,15 @@
 
 use crate::block::{
     BLOCK_DOTS, DATA_LEN, FileTime, MAX_FILE_SIZE, Mode, NAME_LEN, NAME_TEXT_LEN, RawBlock,
-    Redundancy, SuperBlock, recovery_address, row_mask,
+    Redundancy, SuperBlock, row_mask,
 };
 use crate::codec::{self, Compression, MAX_PASSWORD_LEN, SALT_AND_IV_LEN};
 use crate::crc::crc16;
 use crate::error::{Error, Result};
 use crate::layout::{CELL_DOTS, PageLayout, PageSetup};
 use crate::pagetext::{self, TextStyle};
+use crate::pbx::{self, HashRecord, Record, SheetId, SheetRecord};
+use crate::plan::{RECORD_CELLS, RECORD_CELLS_PER_END, Slot, plan_page};
 use crate::raster::{Raster, WHITE};
 
 /// Gray level of data dots; deliberately not black so the grid lines stand out.
@@ -42,6 +44,10 @@ pub struct EncodeOptions {
     pub modified: FileTime,
     /// Windows file attributes stored on the pages.
     pub attributes: u8,
+    /// Whether to add what the original programs do not know: a SHA-256 of the file and an
+    /// identifier and layout for each page, in cells that would repeat the label. The
+    /// originals read such pages as before. Only used when there is room for it.
+    pub extensions: bool,
 }
 
 impl Default for EncodeOptions {
@@ -54,6 +60,7 @@ impl Default for EncodeOptions {
             name: String::new(),
             modified: FileTime::default(),
             attributes: DEFAULT_ATTRIBUTES,
+            extensions: true,
         }
     }
 }
@@ -104,13 +111,17 @@ pub fn encode_with_salt(
     if data.len() > MAX_FILE_SIZE as usize {
         return Err(Error::InputTooLarge(data.len()));
     }
-    let payload = Payload::prepare(data, options, salt_and_iv)?;
     let layout = PageLayout::compute(&options.setup, options.redundancy)?;
-    let label = payload.label(options, layout.page_capacity(options.redundancy));
-    let page_count = payload
-        .bytes
-        .len()
-        .div_ceil(layout.page_capacity(options.redundancy));
+    let records = options.extensions && layout.has_room_for(options.redundancy, RECORD_CELLS);
+    let payload = Payload::prepare(data, options, salt_and_iv, records)?;
+    let reserved = if payload.seal.is_some() {
+        RECORD_CELLS
+    } else {
+        0
+    };
+    let capacity = layout.page_capacity(options.redundancy, reserved);
+    let label = payload.label(options, capacity);
+    let page_count = payload.bytes.len().div_ceil(capacity);
     if page_count > usize::from(u16::MAX) {
         return Err(Error::InvalidSetting(format!(
             "the data needs {page_count} pages; at most {} are possible",
@@ -122,6 +133,7 @@ pub fn encode_with_salt(
         frame: options.setup.frame,
         redundancy: options.redundancy,
         page_count,
+        seal: payload.seal,
         dot_pitch: layout.dx,
         printer_dpi: options.setup.printer_dpi,
     };
@@ -140,6 +152,18 @@ struct Payload {
     mode: Mode,
     file_crc: u16,
     salt_and_iv: Option<[u8; SALT_AND_IV_LEN]>,
+    /// The check value and sheet seed to put on the pages, if they get any.
+    seal: Option<Seal>,
+}
+
+/// What the pages carry to vouch for the file.
+#[derive(Clone, Copy)]
+struct Seal {
+    /// SHA-256 of the file, or for an encrypted file a check value only the password gives.
+    digest: [u8; pbx::HASH_LEN],
+    keyed: bool,
+    /// Hash of the bytes as they are on paper, from which the sheet identifiers come.
+    stream_hash: [u8; pbx::HASH_LEN],
 }
 
 impl Payload {
@@ -147,6 +171,7 @@ impl Payload {
         data: &[u8],
         options: &EncodeOptions,
         salt_and_iv: Option<[u8; SALT_AND_IV_LEN]>,
+        records: bool,
     ) -> Result<Self> {
         let packed = codec::compress(data, options.compression)?;
         let mut mode = Mode::default();
@@ -174,12 +199,29 @@ impl Payload {
             }
             _ => None,
         };
+        // The originals ignore the mode bits they do not know, so this one marks the pages for
+        // readers that look for the records.
+        let has_room = pbx::record_address(bytes.len() as u32, RECORDS_PER_FILE - 1).is_some();
+        let seal = (records && has_room).then(|| Seal {
+            digest: match (password, salt_and_iv) {
+                (Some(password), Some(salt_and_iv)) => {
+                    codec::authenticate(data, password, &salt_and_iv)
+                }
+                _ => pbx::file_hash(data),
+            },
+            keyed: salt_and_iv.is_some(),
+            stream_hash: pbx::file_hash(&bytes),
+        });
+        if seal.is_some() {
+            mode.0 |= Mode::EXTENDED;
+        }
         Ok(Self {
             bytes,
             original_size: data.len(),
             mode,
             file_crc,
             salt_and_iv,
+            seal,
         })
     }
 
@@ -212,18 +254,22 @@ fn truncate_at_char_boundary(text: &str, max_bytes: usize) -> &str {
     &text[..end]
 }
 
+/// Records of a page: which sheet it is, the hash, and the parity of the two.
+const RECORDS_PER_FILE: usize = 3;
+
 struct PageRenderer {
     layout: PageLayout,
     frame: bool,
     redundancy: Redundancy,
     page_count: usize,
+    seal: Option<Seal>,
     dot_pitch: usize,
     printer_dpi: usize,
 }
 
 impl PageRenderer {
     fn render(&self, payload: &[u8], page_index: usize, label: &SuperBlock) -> Raster {
-        let capacity = self.layout.page_capacity(self.redundancy);
+        let capacity = self.layout.page_capacity(self.redundancy, self.reserved());
         let offset = page_index * capacity;
         let on_page = (payload.len() - offset).min(capacity);
         let group = self.redundancy.group_size();
@@ -232,22 +278,21 @@ impl PageRenderer {
 
         let mut label = label.clone();
         label.page = (page_index + 1) as u16;
-        let blocks = place_blocks(
-            &payload[offset..],
+        let slots = plan_page(
             offset as u32,
             groups,
             self.redundancy,
-            self.layout.nx,
-            rows,
-            &label.to_raw(),
+            (self.layout.nx, rows),
+            self.reserved() / 2,
         );
+        let blocks = self.fill(&slots, &payload[offset..], offset as u32, &label, rows);
 
         let mut canvas = Canvas::new(&self.layout, rows);
         canvas.draw_grid_lines(self.frame);
         if self.frame {
             canvas.draw_frame_raster();
         }
-        for (cell, mut block) in blocks {
+        for (cell, mut block) in blocks.into_iter().enumerate() {
             block.seal();
             canvas.draw_block(cell, &block);
         }
@@ -286,80 +331,107 @@ impl PageRenderer {
         page
     }
 
-    /// The last page shrinks to the rows it needs, but never below three.
-    fn rows_needed(&self, groups: usize) -> usize {
-        let blocks = (groups + 1) * (self.redundancy.group_size() + 1) + 1;
-        blocks
-            .div_ceil(self.layout.nx)
-            .max(MIN_ROWS)
-            .min(self.layout.ny)
+    /// Cells of a page kept free for records.
+    fn reserved(&self) -> usize {
+        if self.seal.is_some() { RECORD_CELLS } else { 0 }
     }
-}
 
-/// Decides which block goes into which cell of the page grid.
-///
-/// Every string (`group_size` data strings plus one recovery string) starts
-/// with a superblock. Neighbouring strings are shifted against each other so
-/// blocks of one redundancy group never share a column.
-fn place_blocks(
-    payload: &[u8],
-    first_offset: u32,
-    groups: usize,
-    redundancy: Redundancy,
-    columns: usize,
-    rows: usize,
-    label: &RawBlock,
-) -> Vec<(usize, RawBlock)> {
-    let group = redundancy.group_size();
-    let string_len = groups + 1;
-    let wraps = string_len >= columns;
-    let rotation = |string: usize| {
-        let start = string * string_len;
-        (columns / (group + 1) * string + columns - start % columns) % columns
-    };
-    let cell = |string: usize, position: usize| {
-        let start = string * string_len;
-        if wraps {
-            start + (position + rotation(string)) % string_len
-        } else {
-            start + position
-        }
-    };
-
-    let mut placed = Vec::with_capacity(columns * rows);
-    for string in 0..=group {
-        let start = string * string_len;
-        let at = if wraps {
-            start + rotation(string)
-        } else {
-            start
-        };
-        placed.push((at, label.clone()));
-    }
-    let mut offset = first_offset;
-    for index in 0..groups {
-        let mut recovery = [0xFFu8; DATA_LEN];
-        let group_start = offset;
-        for string in 0..group {
+    /// The block of every cell of a page, in the order of the cells.
+    fn fill(
+        &self,
+        slots: &[Slot],
+        payload: &[u8],
+        first_offset: u32,
+        label: &SuperBlock,
+        rows: usize,
+    ) -> Vec<RawBlock> {
+        let group = self.redundancy.group_size();
+        let data_at = |offset: u32| -> [u8; DATA_LEN] {
             let mut data = [0u8; DATA_LEN];
             let consumed = (offset - first_offset) as usize;
             if consumed < payload.len() {
                 let available = (payload.len() - consumed).min(DATA_LEN);
                 data[..available].copy_from_slice(&payload[consumed..consumed + available]);
             }
-            for (r, d) in recovery.iter_mut().zip(&data) {
-                *r ^= d;
+            data
+        };
+        let label_block = label.to_raw();
+        let records = self.records(label, rows);
+        let last = slots.len() - 1;
+        // One copy of the records at the start of the page, one at its end.
+        let record_in = |cell: usize| {
+            if records.is_empty() {
+                None
+            } else if cell < RECORD_CELLS_PER_END {
+                Some(records[cell].clone())
+            } else if last - cell < RECORD_CELLS_PER_END {
+                Some(records[RECORD_CELLS_PER_END - 1 - (last - cell)].clone())
+            } else {
+                None
             }
-            placed.push((cell(string, index + 1), RawBlock::new(offset, &data)));
-            offset += DATA_LEN as u32;
-        }
-        let address = recovery_address(group_start, redundancy);
-        placed.push((cell(group, index + 1), RawBlock::new(address, &recovery)));
+        };
+        slots
+            .iter()
+            .enumerate()
+            .map(|(cell, slot)| match *slot {
+                Slot::Data(offset) => RawBlock::new(offset, &data_at(offset)),
+                Slot::Recovery(group_start) => {
+                    let mut recovery = [0xFFu8; DATA_LEN];
+                    for string in 0..group {
+                        let data = data_at(group_start + (string * DATA_LEN) as u32);
+                        recovery.iter_mut().zip(&data).for_each(|(r, d)| *r ^= d);
+                    }
+                    let address = slot.address(self.redundancy).unwrap_or(group_start);
+                    RawBlock::new(address, &recovery)
+                }
+                Slot::Label => label_block.clone(),
+                Slot::Spare => record_in(cell).unwrap_or_else(|| label_block.clone()),
+            })
+            .collect()
     }
-    for filler in string_len * (group + 1)..columns * rows {
-        placed.push((filler, label.clone()));
+
+    /// The records of a page: the sheet, the hash and the parity of the two. The page carries
+    /// the set twice, at its start and at its end.
+    fn records(&self, label: &SuperBlock, rows: usize) -> Vec<RawBlock> {
+        let Some(seal) = self.seal else {
+            return Vec::new();
+        };
+        let page = label.page;
+        let sheet_record = SheetRecord {
+            id: SheetId::derive(&seal.stream_hash, page, label.data_size),
+            page,
+            page_count: self.page_count as u16,
+            columns: self.layout.nx as u16,
+            rows: rows as u16,
+            group_size: self.redundancy.group_size() as u8,
+        };
+        let hash_record = HashRecord {
+            digest: seal.digest,
+            original_size: label.original_size,
+            keyed: seal.keyed,
+        };
+        let (sheet, hash) = (Record::Sheet(sheet_record), Record::Hash(hash_record));
+        let parity = Record::parity_of(&sheet_record, &hash_record);
+        [sheet, hash, parity]
+            .into_iter()
+            .enumerate()
+            .map(|(index, record)| {
+                // Room was checked for the highest index when the payload was prepared.
+                let address = pbx::record_address(label.data_size, index).unwrap_or_default();
+                RawBlock::new(address, &record.to_payload())
+            })
+            .collect()
     }
-    placed
+
+    /// The last page shrinks to the rows it needs, but never below three.
+    fn rows_needed(&self, groups: usize) -> usize {
+        let spare = if self.seal.is_some() { RECORD_CELLS } else { 1 };
+        let blocks = (groups + 1) * (self.redundancy.group_size() + 1) + spare;
+        blocks
+            .div_ceil(self.layout.nx)
+            .max(MIN_ROWS)
+            .min(self.layout.ny)
+    }
 }
 
 /// Drawing surface that knows the page geometry.
@@ -519,7 +591,7 @@ mod tests {
         };
         let capacity = PageLayout::compute(&options.setup, options.redundancy)
             .unwrap()
-            .page_capacity(options.redundancy);
+            .page_capacity(options.redundancy, 0);
         let data = vec![0x5Au8; capacity * 2 + 1];
         assert_eq!(encode(&data, &options).unwrap().len(), 3);
     }
@@ -563,25 +635,28 @@ mod tests {
     }
 
     #[test]
-    fn every_cell_of_a_page_is_filled_exactly_once() {
-        let redundancy = Redundancy::default();
-        let (columns, groups) = (12usize, 9usize);
-        let rows = ((groups + 1) * 6 + 1).div_ceil(columns).max(MIN_ROWS);
-        let payload = vec![1u8; groups * 5 * DATA_LEN];
-        let placed = place_blocks(
-            &payload,
-            0,
-            groups,
-            redundancy,
-            columns,
-            rows,
-            &RawBlock::zeroed(),
-        );
-        let mut cells: Vec<usize> = placed.iter().map(|(cell, _)| *cell).collect();
-        cells.sort_unstable();
-        cells.dedup();
-        assert_eq!(cells.len(), placed.len());
-        assert!(cells.iter().all(|&c| c < columns * rows));
+    fn the_hash_of_an_encrypted_file_cannot_be_checked_without_the_password() {
+        let data = b"a secret that is easy to guess";
+        let salt_and_iv = [3u8; SALT_AND_IV_LEN];
+        let encrypted = EncodeOptions {
+            password: Some("pw".into()),
+            ..EncodeOptions::default()
+        };
+        let sealed = Payload::prepare(data, &encrypted, Some(salt_and_iv), true)
+            .unwrap()
+            .seal
+            .unwrap();
+        assert!(sealed.keyed);
+        assert_ne!(sealed.digest, pbx::file_hash(data));
+        let plain = Payload::prepare(data, &EncodeOptions::default(), None, true)
+            .unwrap()
+            .seal
+            .unwrap();
+        assert!(!plain.keyed);
+        assert_eq!(plain.digest, pbx::file_hash(data));
+        // What identifies the sheet comes from the bytes on paper, which anyone can see.
+        let on_paper = Payload::prepare(data, &encrypted, Some(salt_and_iv), true).unwrap();
+        assert_eq!(sealed.stream_hash, pbx::file_hash(&on_paper.bytes));
     }
 
     #[test]

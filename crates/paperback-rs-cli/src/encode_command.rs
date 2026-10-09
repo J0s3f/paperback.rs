@@ -29,6 +29,7 @@ pub(crate) fn run(args: &EncodeArgs) -> Result<()> {
         password: password::read(&args.password)?,
         name: args.name.clone().unwrap_or(source_name),
         modified,
+        extensions: !args.no_extensions,
         ..EncodeOptions::default()
     };
     let pages = encode(&data, &options)?;

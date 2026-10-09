@@ -18,6 +18,7 @@ pub mod hints;
 mod known;
 pub(crate) mod mesh;
 mod peaks;
+mod positions;
 mod reader;
 mod sheet;
 mod skew;
@@ -31,10 +32,11 @@ use assemble::{Assembler, ScannedBlock, ScannedPage};
 use bitmap::Bitmap;
 use known::{KnownBlocks, Placement};
 use reader::{BlockOutcome, BlockReader, Effort};
-use sheet::{BlockKey, LatticeRead, Relation, Sheets, sample_cells};
+use sheet::{BlockKey, LatticeRead, Relation, Sheets, corner_cells, sample_cells};
 
 use crate::block::{BLOCK_DOTS, BlockKind, MAX_FILE_SIZE, RawBlock, SuperBlock};
 use crate::error::{Error, Result};
+use crate::pbx::{self, Record, SheetId};
 use crate::quality::{BlockQuality, PageQuality};
 use crate::raster::{Raster, Turn, WHITE};
 
@@ -186,6 +188,7 @@ fn scan_bitmap(raster: &Raster, reading: &Reading, reduced_by: usize) -> Result<
             keys: collected.keys,
             sheet,
         },
+        records: Vec::new(),
         quality,
     };
     // A reduced picture shows nothing of the scanner's settings; the caller looks at the original.
@@ -198,6 +201,68 @@ fn scan_bitmap(raster: &Raster, reading: &Reading, reduced_by: usize) -> Result<
 /// Blocks read in the first look at a picture; more would only cost time.
 const ENOUGH_SAMPLES: usize = 6;
 
+/// What a first look at a picture found: the blocks read, the keys of those that tell where
+/// they belong, and the identifier of the sheet if a record showed it.
+#[derive(Default)]
+struct FirstLook {
+    outcomes: Vec<Option<BlockOutcome>>,
+    samples: Vec<((usize, usize), BlockKey)>,
+    shown_id: Option<SheetId>,
+}
+
+impl FirstLook {
+    fn add(&mut self, columns: usize, cell: (usize, usize), outcome: BlockOutcome) {
+        if let BlockOutcome::Readable { block, .. } = &outcome {
+            self.samples.extend(block_key(block).map(|key| (cell, key)));
+            self.shown_id = self.shown_id.or_else(|| sheet_id_in(block));
+        }
+        self.outcomes[cell.1 * columns + cell.0] = Some(outcome);
+    }
+}
+
+/// Reads a few cells of a picture that no earlier reading covers and finds out which sheet read
+/// before the picture shows, and how its cells relate. The middle of the picture is tried
+/// first; a picture that matches no sheet by it may show the identifier of a sheet in a corner.
+/// The cells are read with more effort than the quick pass gives, so that they do read.
+fn look_for_sheet(
+    reader: &mut BlockReader,
+    reading: &Reading,
+    (columns, rows): (usize, usize),
+    in_original: &impl Fn((f64, f64)) -> (f64, f64),
+    same_block_within: f64,
+) -> (Vec<Option<BlockOutcome>>, Option<(usize, Relation)>) {
+    let mut look = FirstLook {
+        outcomes: (0..columns * rows).map(|_| None).collect(),
+        ..FirstLook::default()
+    };
+    if reading.sheets.is_empty() {
+        return (look.outcomes, None);
+    }
+    reader.set_effort(Effort::Normal);
+    let read_unknown = |reader: &mut BlockReader, look: &mut FirstLook, cell: (usize, usize)| {
+        let place = in_original(reader.cell_centre(cell.0, cell.1));
+        if !reading.known.is_near(place, same_block_within) {
+            let outcome = reader.read(cell.0, cell.1);
+            look.add(columns, cell, outcome);
+        }
+    };
+    for cell in sample_cells(columns, rows) {
+        if look.samples.len() >= ENOUGH_SAMPLES {
+            break;
+        }
+        read_unknown(reader, &mut look, cell);
+    }
+    let mut sheet = reading.sheets.recognise(&look.samples, look.shown_id);
+    if sheet.is_none() && look.shown_id.is_none() {
+        for cell in corner_cells(columns, rows) {
+            read_unknown(reader, &mut look, cell);
+        }
+        sheet = reading.sheets.recognise(&look.samples, look.shown_id);
+    }
+    reader.set_effort(Effort::Quick);
+    (look.outcomes, sheet)
+}
+
 /// The first pass over all cells of a picture at the lowest effort, skipping the cells where a
 /// block was read already: in an earlier reading of this picture, or in another picture of the
 /// sheet. A first look at a few cells says whether other pictures of the sheet were read and
@@ -209,30 +274,13 @@ fn quick_pass(
     in_original: impl Fn((f64, f64)) -> (f64, f64),
     same_block_within: f64,
 ) -> (Vec<BlockOutcome>, Option<(usize, Relation)>) {
-    let mut first_look: Vec<Option<BlockOutcome>> = (0..columns * rows).map(|_| None).collect();
-    let mut samples: Vec<((usize, usize), BlockKey)> = Vec::new();
-    if !reading.sheets.is_empty() {
-        // The cells must read, so these few are read with more effort than the quick pass gives.
-        reader.set_effort(Effort::Normal);
-        for (column, row) in sample_cells(columns, rows) {
-            if samples.len() >= ENOUGH_SAMPLES {
-                break;
-            }
-            let place = in_original(reader.cell_centre(column, row));
-            if reading.known.is_near(place, same_block_within) {
-                continue;
-            }
-            let outcome = reader.read(column, row);
-            if let BlockOutcome::Readable { block, .. } = &outcome
-                && let Some(key) = block_key(block)
-            {
-                samples.push(((column, row), key));
-            }
-            first_look[row * columns + column] = Some(outcome);
-        }
-        reader.set_effort(Effort::Quick);
-    }
-    let sheet = reading.sheets.recognise(&samples);
+    let (mut first_look, sheet) = look_for_sheet(
+        reader,
+        reading,
+        (columns, rows),
+        &in_original,
+        same_block_within,
+    );
     let known_in_sheet = sheet.map(|found| reading.sheets.known_cells(found, columns, rows));
     let mut outcomes: Vec<BlockOutcome> = Vec::with_capacity(columns * rows);
     for row in 0..rows {
@@ -251,6 +299,17 @@ fn quick_pass(
         }
     }
     (outcomes, sheet)
+}
+
+/// The identifier of the sheet a block says it belongs to, if it is a sheet record.
+fn sheet_id_in(block: &RawBlock) -> Option<SheetId> {
+    match (
+        BlockKind::of(block.address()),
+        Record::parse(&block.payload_array()),
+    ) {
+        (BlockKind::Data { .. }, Some(Record::Sheet(sheet))) => Some(sheet.id),
+        _ => None,
+    }
 }
 
 /// What the outcomes of reading all cells of a page add up to.
@@ -314,6 +373,8 @@ fn collect(
 fn block_key(block: &RawBlock) -> Option<BlockKey> {
     match BlockKind::of(block.address()) {
         BlockKind::Superblock => None,
+        // Records are the same on every sheet of a file and say nothing about the cell.
+        BlockKind::Data { .. } if pbx::is_record(&block.payload_array()) => None,
         BlockKind::Data { offset } => Some((false, offset)),
         BlockKind::Recovery { offset, .. } => Some((true, offset)),
     }
@@ -681,7 +742,8 @@ pub fn decode(
             &sheets,
         ) {
             Ok(mut page) => {
-                sheets.record(&page.lattice, &page.label);
+                positions::examine(&mut page);
+                sheets.record(&page.lattice, &page.label, page.statistics.sheet_id);
                 on_page(PageOutcome {
                     index,
                     result: Ok(page.statistics),
@@ -731,7 +793,9 @@ mod tests {
         let (width, height) = (raster.width(), raster.height());
         let mut pixels = raster.into_pixels();
         let top_band = layout.text.map_or(0, |text| text.top_band());
-        for cell in string_len + 2..string_len + 5 {
+        // The blocks start after the cells kept for the records.
+        let first = crate::plan::RECORD_CELLS_PER_END + string_len;
+        for cell in first + 2..first + 5 {
             let (x, y) = layout.cell_origin(cell);
             for row in top_band + y..top_band + y + 32 * layout.dy {
                 pixels[row * width + x..row * width + x + 32 * layout.dx].fill(255);
@@ -742,5 +806,124 @@ mod tests {
         let file = decode(&[raster], &DecodeOptions::default(), |_| {}).unwrap();
         assert_eq!(file.data, data);
         assert_eq!(file.report.recovered_blocks, 3);
+    }
+
+    /// A page of the small file, and the page geometry to find its cells.
+    fn small_page() -> (Vec<u8>, Raster, PageLayout, usize) {
+        let data: Vec<u8> = (0..FILE_LEN).map(|i| (i * 131 + i / 3) as u8).collect();
+        let options = EncodeOptions {
+            setup: PageSetup {
+                printer_dpi: 300,
+                dot_dpi: 100,
+                ..PageSetup::default()
+            },
+            compression: Compression::None,
+            ..EncodeOptions::default()
+        };
+        let layout = PageLayout::compute(&options.setup, options.redundancy).unwrap();
+        let raster = encode(&data, &options).unwrap().remove(0).raster;
+        let bands = layout.text.map_or(0, |t| t.top_band() + t.bottom_band());
+        let rows = (1..=layout.ny)
+            .find(|&rows| layout.image_height(rows) + bands == raster.height())
+            .unwrap();
+        (data, raster, layout, rows)
+    }
+
+    fn wiped(raster: Raster, layout: &PageLayout, cells: &[usize]) -> Raster {
+        let (width, height) = (raster.width(), raster.height());
+        let mut pixels = raster.into_pixels();
+        let top_band = layout.text.map_or(0, |text| text.top_band());
+        for &cell in cells {
+            let (x, y) = layout.cell_origin(cell);
+            for row in top_band + y..top_band + y + 32 * layout.dy {
+                pixels[row * width + x..row * width + x + 32 * layout.dx].fill(255);
+            }
+        }
+        Raster::from_pixels(width, height, pixels).unwrap()
+    }
+
+    #[test]
+    fn the_records_survive_the_loss_of_one_end_of_the_page() {
+        use crate::plan::RECORD_CELLS_PER_END;
+        let (data, raster, layout, rows) = small_page();
+        let last = layout.nx * rows - 1;
+        for lost in [
+            (0..RECORD_CELLS_PER_END).collect::<Vec<_>>(),
+            (last + 1 - RECORD_CELLS_PER_END..=last).collect(),
+        ] {
+            let page = wiped(raster.clone(), &layout, &lost);
+            let file = decode(&[page], &DecodeOptions::default(), |_| {}).unwrap();
+            assert_eq!(file.data, data);
+            assert_eq!(file.report.integrity, crate::Integrity::Verified);
+        }
+    }
+
+    #[test]
+    fn a_lost_record_is_rebuilt_from_the_parity_record() {
+        let (data, raster, layout, rows) = small_page();
+        let last = layout.nx * rows - 1;
+        // The hash record at both ends: the second cell of the first set, the middle one of the last.
+        let page = wiped(raster, &layout, &[1, last - 1]);
+        let file = decode(&[page], &DecodeOptions::default(), |_| {}).unwrap();
+        assert_eq!(file.data, data);
+        assert_eq!(file.report.integrity, crate::Integrity::Verified);
+    }
+
+    #[test]
+    fn a_page_that_lost_all_its_records_still_restores_the_file() {
+        use crate::plan::RECORD_CELLS_PER_END;
+        let (data, raster, layout, rows) = small_page();
+        let last = layout.nx * rows - 1;
+        let both_ends: Vec<usize> = (0..RECORD_CELLS_PER_END)
+            .chain(last + 1 - RECORD_CELLS_PER_END..=last)
+            .collect();
+        let page = wiped(raster, &layout, &both_ends);
+        let file = decode(&[page], &DecodeOptions::default(), |_| {}).unwrap();
+        assert_eq!(file.data, data);
+        assert_eq!(file.report.integrity, crate::Integrity::Missing);
+    }
+
+    /// Writes the pages of a file with damaged record cells, for `tools/interop/damaged.ps1`,
+    /// which has the original programs and an older paperback.rs read them. Settings as
+    /// `tools/interop/matrix.ps1` uses.
+    #[test]
+    #[ignore = "writes files; run by tools/interop/damaged.ps1"]
+    fn write_pages_with_damaged_records() {
+        use crate::encode::Page;
+        use crate::plan::RECORD_CELLS_PER_END as END;
+        let (Ok(input), Ok(out)) = (std::env::var("PB_INPUT"), std::env::var("PB_OUT")) else {
+            return;
+        };
+        let data = std::fs::read(input).unwrap();
+        let options = EncodeOptions {
+            setup: PageSetup {
+                printer_dpi: 300,
+                dot_dpi: 200,
+                ..PageSetup::default()
+            },
+            ..EncodeOptions::default()
+        };
+        let layout = PageLayout::compute(&options.setup, options.redundancy).unwrap();
+        let bands = layout.text.map_or(0, |t| t.top_band() + t.bottom_band());
+        for (at, page) in encode(&data, &options).unwrap().into_iter().enumerate() {
+            let rows = (1..=layout.ny)
+                .find(|&rows| layout.image_height(rows) + bands == page.raster.height())
+                .unwrap();
+            let last = layout.nx * rows - 1;
+            let cases: [(&str, Vec<usize>); 3] = [
+                ("head", (0..END).collect()),
+                ("ends", (0..END).chain(last + 1 - END..=last).collect()),
+                ("hash", vec![1, last - 1]),
+            ];
+            for (name, cells) in cases {
+                let raster = wiped(page.raster.clone(), &layout, &cells);
+                let damaged = Page {
+                    raster,
+                    dpi: page.dpi,
+                };
+                let path = format!("{out}/{name}-{:02}.bmp", at + 1);
+                std::fs::write(path, crate::imageio::write_bmp(&damaged)).unwrap();
+            }
+        }
     }
 }

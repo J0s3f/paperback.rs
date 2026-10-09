@@ -62,6 +62,7 @@ impl From<paperback_rs::Error> for CliError {
             | E::Decode(_)
             | E::NoReadablePage
             | E::Incomplete { .. }
+            | E::HashMismatch
             | E::Decompress(_) => Kind::BadInput,
             _ => Kind::Other,
         };

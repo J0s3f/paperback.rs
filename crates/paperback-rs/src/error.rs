@@ -42,6 +42,9 @@ pub enum Error {
     #[error("wrong password")]
     /// The password does not match the backup.
     WrongPassword,
+    #[error("the restored file does not match the SHA-256 stored on the pages")]
+    /// The pages carry a hash of the file and the restored file differs from it.
+    HashMismatch,
     #[error("no page carries a readable label")]
     /// No page carries a readable label.
     NoReadablePage,

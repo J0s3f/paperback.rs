@@ -253,3 +253,61 @@ is found to show a known sheet takes that sheet's label. When the assembler hold
 read. Skipped cells still count as known places for the later attempts on the same picture (the rotated copies), and
 neighbours that a retry needs are read like any other block. Not done: a map from cells to addresses without reading
 (which would need the layout of the sheet, or a layout record on the page).
+
+## Extension records
+
+Question: can paperback.rs put more on its pages (a sheet identifier, a strong checksum) and still be read by PaperBack
+1.00 and 1.10? Source for the answer: the C++ of both programs (`Decoder.cpp`, `Fileproc.cpp`, `Printer.cpp`), read for
+what they validate, and then tested against the real executables (`tools/interop`).
+
+What the originals check is little: the checksum of each block, and the label fields that identify a file (name, mode,
+time, sizes). `Addblock` drops a data block whose address is not a multiple of 90 or lies at or behind the end of
+the data, without any effect; the return value is not even looked at. That is the opening: **records are data blocks
+behind the end of the data.** They take cells that would otherwise repeat the label, so the capacity of a page is
+unchanged.
+
+Chosen:
+
+- **SHA-256 of the original file** in a record; for an encrypted file an HMAC-SHA256 under a key stretched from the
+  password (a second PBKDF2 block, so the cipher key stays the one 1.10 derives). A plain hash of the plaintext
+  on paper would be a way to test guesses of what the file says. The 16-bit file checksum of the format covers encrypted files only and
+  the block checksums cannot tell a block from another file's block. The hash is computed before compression and
+  encryption, so it also catches a wrong decompression. A mismatch is an error, not a warning: a file that fails
+  its own hash is not what was backed up.
+- **Sheet identifier and layout** (columns, rows, group size, page, page count) in a record. The identifier is derived
+  from the hash of the data stream as it is on paper and the page, so printing a page again gives the same sheet; no randomness, and the output stays
+  reproducible. The layout lets the decoder work out the block of every cell and check what it read (`positions.rs`).
+- **Mode bit 0x04** marks the pages. The originals compare the mode between pages but test only bits 0 and 1.
+
+- **Records far apart, with a parity record.** The first design put two copies of each record side by side in the spare
+  cells at the end of the page, where one stain or crease takes all of them. Now the page keeps three cells at its start and
+  three at its end for a full set, and a third record is the XOR of the other two, so any one of the three can be lost at
+  either end. The records are not part of a recovery group of the page (they are not in the data stream); the costs of this
+  are six cells per page and that capacity of a page in the label is a few blocks smaller than the grid allows.
+
+- **The identifier in matching.** A picture whose first look (the middle cells) matches no known sheet is looked at in its
+  four corners, where a record can be whatever the turn. A picture showing an identifier is never matched to a sheet with
+  another one, and one showing the same identifier needs two agreeing blocks instead of three. The vote on block
+  addresses stays the judge of how the grids relate; the identifier says only which sheet.
+
+Rejected, with the reason:
+
+- *A hash trailer inside the data stream.* The stream is read by bzip2 and the cipher; whether the original bzip2
+  library tolerates trailing bytes is an assumption that could not be checked against its source.
+- *Non-zero address nibbles.* The originals take them for recovery blocks: the last one read sets the group size of
+  the whole page and its payload is XORed into free slots.
+- *Per-block checks.* All 128 bytes of a block are used.
+- *Marks on the frame or inside the dot grid.* The original finds the grid from it.
+- *A second recovery block per group.* 90 bytes per group, and the originals gain nothing.
+
+The position check (a block must be in the cell the layout gives it) protects against the one weakness of the
+checksums: with many reading attempts per block and erasures that leave the error correction little to check with
+(24 of 32 parity bytes), a damaged block can now and then pass as a different block. Estimated by calculation, not
+observed; the check is cheap insurance. It needs the layout, so it
+applies to pages written by this program; other pages are read as before. It only acts if most of the blocks of a picture
+agree with the layout (the same vote as for combining pictures, `decode/sheet.rs`), so a picture that does not match
+changes nothing.
+
+Not done: a map of cells to addresses used to read *less* (skip blocks) or *more* (aim the effort at cells that must
+hold data), authenticated encryption (a MAC could be stripped from the pages unless readers insist on it), a second
+recovery layer.

@@ -36,7 +36,7 @@ data block (128 bytes)           superblock (128 bytes)
 Cells are `35 x dot pitch` pixels wide: a 32-dot block plus two dots before and one after a black grid
 line. Rows run left to right. A group of `r` data strings plus one recovery string (each string is a
 superblock followed by one block per group) is laid out so that members of one group are never in
-the same column; remaining cells repeat the superblock. Details: `encode.rs`, `place_blocks`.
+the same column; remaining cells repeat the superblock. Details: `plan.rs`.
 
 ## Data stream
 
@@ -46,3 +46,42 @@ superblock -> AES-192-CBC (optional) -> split into 90-byte blocks.
 Key: PBKDF2-HMAC-SHA256, password as one byte per character, 16-byte salt, 524288 rounds, 24 bytes.
 The IV is stored next to the salt. PaperBack 1.00 instead used AES-256-ECB with the password padded
 with zeros as key (decrypt-only here).
+
+## Extension records (PBX1, paperback.rs only)
+
+paperback.rs adds information that PaperBack 1.00 and 1.10 do not know, in a way they ignore. Both originals accept a
+data block only if its address is a multiple of 90 below the end of the data (`Addblock` in `Fileproc.cpp`) and drop
+any other data block without effect. A **record** is a data block whose address lies *behind* the end of the data, at
+`ceil(data size / 90) * 90 + 90 * n`. A page gives up six cells for them (a few blocks of capacity; the label of the
+page says how many bytes a page holds, so the originals are not misled). The block checksum and the error correction
+protect them like any block.
+
+A record is 90 bytes: `PBX1`, a kind byte, a version byte (1), then the body, zero padded.
+
+| Kind | Address `n` | Body |
+|---|---|---|
+| 1, sheet | 0 | sheet identifier (16 bytes), page, page count, columns, rows (each 2 bytes, little endian), group size (1 byte) |
+| 2, hash | 1 | check value (32 bytes), size of the original file (4 bytes), keyed flag (1 byte) |
+| 3, parity | 2 | the bytes after the header of the sheet record and of the hash record, added up without carry (XOR) |
+
+The check value is the SHA-256 of the file as it was given, before compression and encryption, so it also vouches for the
+decompression. For an **encrypted** file it is instead HMAC-SHA256 of the file under a key from the second block of the
+PBKDF2 output (bytes 32 to 63; the cipher key, bytes 0 to 23, is the one PaperBack 1.10 derives), and the keyed flag is
+1: a plain hash of the plaintext on paper would let anyone confirm a guess of the contents. The keyed value also detects a
+wrong password, which the 16-bit checksum of the format misses once in 65536 tries.
+
+The sheet identifier is the first 16 bytes of SHA-256 of `"PBX1 sheet"`, the SHA-256 of the data stream as it is on paper
+(compressed and encrypted), the page number and the stored size: the same page of the same file always has the same
+identifier, and nothing in it depends on the contents of an encrypted file.
+
+The page carries the three records twice: in its first three cells and in its last three, which are at opposite corners of
+the page. Any two of the three records give the third, so a stain, a crease or a torn corner that takes one end still
+leaves the set, and a half-lost set is completed. The blocks of the data start after the first three cells; shifting all
+of them by the same number keeps the blocks of one group in different columns. The mode byte of the label gets bit `0x04`; the originals look at bits `0x01`
+(compressed) and `0x02` (encrypted) only, and a decoder that finds the bit but no hash says so.
+
+Never usable: addresses with a non-zero high nibble (the originals take them for recovery blocks and may corrupt
+the file), and anything appended to the data stream (it would reach bzip2 and the cipher).
+
+With the layout of a page known, a decoder works out the block each cell must hold (`plan.rs`) and distrusts a block
+read in another cell. See `docs/decisions.md`, "Extension records".

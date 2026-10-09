@@ -95,15 +95,43 @@ pub(crate) fn random_salt_and_iv() -> Result<[u8; SALT_AND_IV_LEN]> {
     Ok(bytes)
 }
 
-fn derive_key(password: &str, salt: &[u8]) -> [u8; KEY_LEN] {
-    let mut key = [0u8; KEY_LEN];
+/// Bytes of the key stretching beyond the cipher key; the key of the check value comes from the
+/// second block of the PBKDF2 output, so the cipher key is the same as PaperBack 1.10 derives.
+const MAC_KEY_OFFSET: usize = 32;
+const MAC_KEY_LEN: usize = 32;
+
+fn stretch(password: &str, salt: &[u8]) -> [u8; MAC_KEY_OFFSET + MAC_KEY_LEN] {
+    let mut keys = [0u8; MAC_KEY_OFFSET + MAC_KEY_LEN];
     pbkdf2::pbkdf2_hmac::<Sha256>(
         &password_bytes(password),
         salt,
         KEY_STRETCHING_ROUNDS,
-        &mut key,
+        &mut keys,
     );
+    keys
+}
+
+fn derive_key(password: &str, salt: &[u8]) -> [u8; KEY_LEN] {
+    let mut key = [0u8; KEY_LEN];
+    key.copy_from_slice(&stretch(password, salt)[..KEY_LEN]);
     key
+}
+
+/// A check value of `plain` that only the password can reproduce: HMAC-SHA256 under a key
+/// stretched from the password and the salt. A plain hash of the plaintext would let anyone
+/// who sees the page confirm a guess of the contents.
+pub(crate) fn authenticate(
+    plain: &[u8],
+    password: &str,
+    salt_and_iv: &[u8; SALT_AND_IV_LEN],
+) -> [u8; MAC_KEY_LEN] {
+    use hmac::{KeyInit, Mac};
+    let keys = stretch(password, &salt_and_iv[..SALT_LEN]);
+    // A key of any length is accepted by HMAC.
+    let mut mac = hmac::Hmac::<Sha256>::new_from_slice(&keys[MAC_KEY_OFFSET..])
+        .unwrap_or_else(|_| unreachable!("HMAC takes keys of any length"));
+    mac.update(plain);
+    mac.finalize().into_bytes().into()
 }
 
 /// AES-192-CBC without padding; `salt_and_iv` is the 32 bytes stored in the
@@ -213,6 +241,27 @@ mod tests {
         assert_ne!(data, plain);
         decrypt_legacy(&mut data, "secret").unwrap();
         assert_eq!(data, plain);
+    }
+
+    #[test]
+    fn the_check_value_depends_on_the_password_the_salt_and_the_data() {
+        let salt_and_iv = [9u8; SALT_AND_IV_LEN];
+        let value = authenticate(b"data", "correct horse", &salt_and_iv);
+        assert_eq!(value, authenticate(b"data", "correct horse", &salt_and_iv));
+        assert_ne!(value, authenticate(b"data", "battery staple", &salt_and_iv));
+        assert_ne!(value, authenticate(b"datb", "correct horse", &salt_and_iv));
+        assert_ne!(
+            value,
+            authenticate(b"data", "correct horse", &[8u8; SALT_AND_IV_LEN])
+        );
+    }
+
+    #[test]
+    fn the_cipher_key_is_the_first_block_of_the_stretching_alone() {
+        // PaperBack 1.10 asks PBKDF2 for 24 bytes; asking for more must not change them.
+        let mut short = [0u8; KEY_LEN];
+        pbkdf2::pbkdf2_hmac::<Sha256>(b"pw", &[1u8; SALT_LEN], KEY_STRETCHING_ROUNDS, &mut short);
+        assert_eq!(derive_key("pw", &[1u8; SALT_LEN]), short);
     }
 
     #[test]

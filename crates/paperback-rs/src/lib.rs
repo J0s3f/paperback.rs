@@ -43,12 +43,15 @@ pub mod error;
 pub mod imageio;
 pub mod layout;
 mod pagetext;
+mod pbx;
 mod pdfimage;
+mod plan;
 pub mod quality;
 pub mod raster;
 mod reed_solomon;
 
 pub use error::{Error, Result};
+pub use pbx::{Integrity, SheetId};
 
 #[cfg(test)]
 mod original_vectors;

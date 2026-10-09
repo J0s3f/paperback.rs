@@ -142,6 +142,11 @@ try {
         Handle-Dialog $h
       }
     }
+    # Only one password is ever offered, so this message is final; waiting for the timeout would only waste time.
+    if ($Action -eq 'open' -and (([W]::Texts($mainWnd) -join ' ') -match 'Invalid password')) {
+      Write-Host 'original says: Invalid password'
+      break
+    }
     if ($pendingMore) {
       $proc.Refresh(); $cpu = $proc.TotalProcessorTime
       if ($cpu -eq $lastCpu) { if (-not $idleSince) { $idleSince = Get-Date } elseif (((Get-Date) - $idleSince).TotalSeconds -ge 2) { $pendingMore = $false; $idleSince = $null; Start-Command } }

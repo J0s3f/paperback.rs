@@ -94,9 +94,13 @@ paperback-rs decode photo1.jpg photo2.jpg photo3.jpg -o report.tar -v
 - **How it works.** Every block that is read carries its address in the file, so blocks from different pictures slot
   together and duplicates are dropped. Which blocks are still missing after one picture does not matter; the next
   picture only has to show them.
-- **Which pictures belong together.** The decoder recognises the sheet from the label printed on it and from the blocks
-  read, so you can pass the pictures in any order, turned or mirrored, at different sizes, and mix photos with scans.
-  Pictures of different pages of one file work the same way. Pictures of different files are refused with a message.
+- **Which pictures belong together.** The decoder recognises the sheet from information stored in the dots, not from the
+  printed text. Each page repeats a few *label blocks* among the data (the file name, size, date and page number, as
+  dots like everything else), pages from this version also carry a sheet identifier, and every block has its address in the
+  file. From these it works out which file and page a picture shows and how its grid lies against the other pictures.
+  You can pass the pictures in any order, turned or mirrored, at different sizes, and mix photos with scans. Pictures of
+  different pages of one file work the same way. Pictures of different files are refused with a message. The title
+  above the dots and the hint below them are for people only; the decoder never reads them.
 - **What helps most.** Pictures that fail in different places: another angle, other light, the creased part laid
   flat, a second scanner. Two pictures with the same shadow have the same gaps. A close-up of a corner is of use only if
   the grid of blocks is clearly visible in it.
@@ -186,6 +190,13 @@ This is tested two ways: `crates/paperback-rs/tests/fixtures/original` holds pag
 and 1.10 programs, which run in CI without the original executables, and `tools/interop` holds Windows scripts
 that drive the original programs through their file dialogs to check both directions on demand (they never
 print or scan).
+
+## Extras that the original does not have
+
+Pages written by paperback.rs carry a SHA-256 of the file and an identifier and layout for each sheet. The originals
+ignore them (tested with 1.00 and 1.10); paperback.rs uses them to check the restored file against the hash, to tell
+sheets apart and to distrust a block read in the wrong place. `decode -v` reports them. To write plain pages without them
+use `--no-extensions`. Details: `docs/format.md`.
 
 ## Status
 

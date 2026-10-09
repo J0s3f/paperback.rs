@@ -25,7 +25,7 @@ const CRC_MASK: u16 = 0x55AA;
 const ECC_PAD: usize = 127;
 const ECC_OFFSET: usize = 96;
 const GROUP_SHIFT: u32 = 28;
-const ADDRESS_MASK: u32 = 0x0FFF_FFFF;
+pub(crate) const ADDRESS_MASK: u32 = 0x0FFF_FFFF;
 
 pub(crate) const NAME_LEN: usize = 64;
 /// Part of the name field that carries text; the rest holds salt and IV.
@@ -202,9 +202,16 @@ pub(crate) struct Mode(pub u8);
 impl Mode {
     pub(crate) const COMPRESSED: u8 = 0x01;
     pub(crate) const ENCRYPTED: u8 = 0x02;
+    /// Set by this program for pages that carry PBX1 records. The originals look at the two
+    /// bits above only.
+    pub(crate) const EXTENDED: u8 = 0x04;
 
     pub(crate) fn is_compressed(self) -> bool {
         self.0 & Self::COMPRESSED != 0
+    }
+
+    pub(crate) fn is_extended(self) -> bool {
+        self.0 & Self::EXTENDED != 0
     }
 
     pub(crate) fn is_encrypted(self) -> bool {

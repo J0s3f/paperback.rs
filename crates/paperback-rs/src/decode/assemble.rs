@@ -11,6 +11,7 @@ use crate::block::{DATA_LEN, FileTime, SuperBlock};
 use crate::codec::{self, SALT_AND_IV_LEN};
 use crate::crc::crc16;
 use crate::error::{Error, Result};
+use crate::pbx::{self, HashRecord, Integrity, Record, SheetId};
 use crate::quality::PageQuality;
 
 /// What was read from one page.
@@ -27,6 +28,8 @@ pub(crate) struct ScannedPage {
     pub(crate) block_size: f64,
     /// The grid of the first reading of the picture and the block read in each cell.
     pub(crate) lattice: LatticeRead,
+    /// The PBX1 records read from the page.
+    pub(crate) records: Vec<Record>,
     /// How well each block read, when asked for.
     pub(crate) quality: Option<PageQuality>,
 }
@@ -48,6 +51,7 @@ impl ScannedPage {
         if self.lattice.columns == 0 {
             self.lattice = other.lattice;
         }
+        self.records.extend(other.records);
         if self.block_size <= 0.0 {
             self.block_size = other.block_size;
         }
@@ -84,8 +88,18 @@ pub(crate) enum ScannedBlock {
 }
 
 impl ScannedBlock {
+    /// The PBX1 record this block is, if it lies behind the data of a file of `data_size` bytes.
+    pub(crate) fn record(&self, data_size: u32) -> Option<Record> {
+        match self {
+            Self::Data { offset, payload } if pbx::is_record_address(data_size, *offset) => {
+                Record::parse(payload)
+            }
+            _ => None,
+        }
+    }
+
     /// Whether it is a recovery block, and the offset it covers.
-    fn identity(&self) -> (bool, u32) {
+    pub(crate) fn identity(&self) -> (bool, u32) {
         match *self {
             Self::Data { offset, .. } => (false, offset),
             Self::Recovery { offset, .. } => (true, offset),
@@ -104,6 +118,11 @@ pub struct PageStatistics {
     pub superblocks: usize,
     /// Bytes repaired by error correction.
     pub restored_bytes: usize,
+    /// Blocks that were read in a cell where the layout of the page does not put them, and
+    /// that were dropped. Without a layout on the page there is nothing to compare with.
+    pub misplaced_blocks: usize,
+    /// Which sheet the page is, when it says so.
+    pub sheet_id: Option<SheetId>,
     /// What looks wrong with the scan; only filled in for pages that read badly.
     pub hints: ScanHints,
 }
@@ -121,6 +140,12 @@ pub struct Report {
     pub restored_bytes: usize,
     /// Blocks rebuilt from recovery blocks.
     pub recovered_blocks: usize,
+    /// Blocks dropped because they were read in the wrong cell of their page.
+    pub misplaced_blocks: usize,
+    /// The sheets the pages are, as far as they say so.
+    pub sheets: Vec<SheetId>,
+    /// Whether the restored file matches the hash on the pages.
+    pub integrity: Integrity,
     /// What looks wrong with the scans that read badly, over all pages.
     pub hints: ScanHints,
 }
@@ -158,6 +183,8 @@ struct Backup {
     legacy_name: bool,
     lowest_address: u32,
     highest_address: u32,
+    /// The hash the pages carry for the whole file.
+    hash: Option<HashRecord>,
     report: Report,
 }
 
@@ -175,6 +202,7 @@ impl Backup {
             legacy_name: false,
             lowest_address: u32::MAX,
             highest_address: 0,
+            hash: None,
             report: Report::default(),
         }
     }
@@ -203,6 +231,23 @@ impl Backup {
         self.group_size = page.group_size;
         self.lowest_address = u32::MAX;
         self.highest_address = 0;
+    }
+
+    /// Takes note of what a page says about the file and about itself.
+    fn add_records(&mut self, page: &ScannedPage) {
+        for record in &page.records {
+            match *record {
+                Record::Hash(hash) if hash.original_size == self.label.original_size => {
+                    self.hash.get_or_insert(hash);
+                }
+                Record::Hash(_) | Record::Sheet(_) | Record::Parity(_) => {}
+            }
+        }
+        if let Some(id) = page.statistics.sheet_id
+            && !self.report.sheets.contains(&id)
+        {
+            self.report.sheets.push(id);
+        }
     }
 
     fn add_block(&mut self, block: &ScannedBlock) {
@@ -331,6 +376,7 @@ impl Backup {
         } else {
             self.data[..original_len.min(data_len)].to_vec()
         };
+        self.report.integrity = self.verify(&data, password)?;
         Ok(RestoredFile {
             data,
             name: if self.legacy_name {
@@ -342,6 +388,27 @@ impl Backup {
             attributes: label.attributes,
             report: self.report,
         })
+    }
+
+    /// Compares the file with the check value on the pages, if they carry one that fits the file.
+    fn verify(&self, data: &[u8], password: Option<&str>) -> Result<Integrity> {
+        let encrypted = self.label.mode.is_encrypted();
+        let digest = match (self.hash, password) {
+            (Some(hash), _) if !hash.keyed && !encrypted => {
+                Some((hash.digest, pbx::file_hash(data)))
+            }
+            (Some(hash), Some(password)) if hash.keyed && encrypted && !self.legacy_name => Some((
+                hash.digest,
+                codec::authenticate(data, password, &self.label.salt_and_iv()),
+            )),
+            _ => None,
+        };
+        match digest {
+            Some((announced, computed)) if announced == computed => Ok(Integrity::Verified),
+            Some(_) => Err(Error::HashMismatch),
+            None if self.label.mode.is_extended() => Ok(Integrity::Missing),
+            None => Ok(Integrity::Unchecked),
+        }
     }
 
     fn decrypt(&mut self, password: Option<&str>) -> Result<()> {
@@ -398,6 +465,8 @@ impl Assembler {
         for block in &page.blocks {
             backup.add_block(block);
         }
+        backup.add_records(page);
+        backup.report.misplaced_blocks += page.statistics.misplaced_blocks;
         backup.report.pages_read += 1;
         backup.report.good_blocks += page.statistics.good_blocks + page.statistics.superblocks;
         backup.report.bad_blocks += page.statistics.bad_blocks;
@@ -474,6 +543,7 @@ mod tests {
             read_places: Vec::new(),
             block_size: 0.0,
             lattice: LatticeRead::default(),
+            records: Vec::new(),
             quality: None,
         }
     }
@@ -507,6 +577,66 @@ mod tests {
         let backup = &assembler.backups[0];
         assert_eq!(backup.report.recovered_blocks, 1);
         assert_eq!(&backup.data[2 * DATA_LEN..3 * DATA_LEN], &group[2]);
+    }
+
+    fn complete_page(records: Vec<Record>) -> ScannedPage {
+        let blocks = (0..10)
+            .map(|i| ScannedBlock::Data {
+                offset: (i * DATA_LEN) as u32,
+                payload: payload(i as u8),
+            })
+            .collect();
+        ScannedPage {
+            records,
+            ..page_with(blocks, 0)
+        }
+    }
+
+    fn hash_of_the_file() -> HashRecord {
+        let file: Vec<u8> = (0..10).flat_map(|i| payload(i as u8)).collect();
+        HashRecord {
+            digest: pbx::file_hash(&file),
+            original_size: 10 * DATA_LEN as u32,
+            keyed: false,
+        }
+    }
+
+    #[test]
+    fn a_file_with_the_hash_on_the_pages_is_verified() {
+        let mut assembler = Assembler::new();
+        assembler.add_page(&complete_page(vec![Record::Hash(hash_of_the_file())]));
+        let restored = assembler.finish(None).unwrap();
+        assert_eq!(restored.report.integrity, Integrity::Verified);
+    }
+
+    #[test]
+    fn a_file_that_differs_from_the_hash_on_the_pages_is_refused() {
+        let mut wrong = hash_of_the_file();
+        wrong.digest[0] ^= 1;
+        let mut assembler = Assembler::new();
+        assembler.add_page(&complete_page(vec![Record::Hash(wrong)]));
+        assert!(matches!(assembler.finish(None), Err(Error::HashMismatch)));
+    }
+
+    #[test]
+    fn a_hash_of_another_file_is_not_taken_for_this_one() {
+        let mut other = hash_of_the_file();
+        other.original_size += 1;
+        other.digest[0] ^= 1;
+        let mut assembler = Assembler::new();
+        assembler.add_page(&complete_page(vec![Record::Hash(other)]));
+        let restored = assembler.finish(None).unwrap();
+        assert_eq!(restored.report.integrity, Integrity::Unchecked);
+    }
+
+    #[test]
+    fn pages_that_announce_a_hash_but_show_none_are_reported() {
+        let mut page = complete_page(Vec::new());
+        page.label.mode = Mode(Mode::EXTENDED);
+        let mut assembler = Assembler::new();
+        assembler.add_page(&page);
+        let restored = assembler.finish(None).unwrap();
+        assert_eq!(restored.report.integrity, Integrity::Missing);
     }
 
     #[test]

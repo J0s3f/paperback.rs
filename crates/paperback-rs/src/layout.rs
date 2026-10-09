@@ -195,9 +195,16 @@ impl PageLayout {
 
     /// Bytes of payload on a full page: per string of `group` data blocks one
     /// recovery block and, per page, one superblock for every string.
-    pub(crate) fn page_capacity(&self, redundancy: Redundancy) -> usize {
+    ///
+    /// `reserved` cells are kept free for other uses (see [`crate::plan::RECORD_CELLS`]).
+    pub(crate) fn page_capacity(&self, redundancy: Redundancy, reserved: usize) -> usize {
         let group = redundancy.group_size();
-        ((self.nx * self.ny - group - 2) / (group + 1)) * group * DATA_LEN
+        ((self.nx * self.ny - reserved - group - 2) / (group + 1)) * group * DATA_LEN
+    }
+
+    /// Whether the page is large enough to give up `reserved` cells and still hold data.
+    pub(crate) fn has_room_for(&self, redundancy: Redundancy, reserved: usize) -> bool {
+        self.nx * self.ny >= reserved + 2 * redundancy.group_size() + 2
     }
 
     pub(crate) fn image_width(&self) -> usize {
@@ -243,7 +250,7 @@ mod tests {
     fn default_a4_page_at_600_dpi_holds_a_sensible_amount() {
         let layout = PageLayout::compute(&PageSetup::default(), Redundancy::default()).unwrap();
         assert_eq!((layout.dx, layout.px), (3, 2));
-        let capacity = layout.page_capacity(Redundancy::default());
+        let capacity = layout.page_capacity(Redundancy::default(), 0);
         assert!(
             (100_000..400_000).contains(&capacity),
             "capacity {capacity}"

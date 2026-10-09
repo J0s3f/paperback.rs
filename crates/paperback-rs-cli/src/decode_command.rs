@@ -4,6 +4,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use paperback_rs::Integrity;
 use paperback_rs::block::FileTime;
 use paperback_rs::decode::{DecodeOptions, PageOutcome, RestoredFile, decode};
 use paperback_rs::imageio;
@@ -33,6 +34,9 @@ pub(crate) fn run(args: &DecodeArgs) -> Result<()> {
     reports.finish()?;
     let restored = restored?;
     write_output(args.output.as_deref(), &restored.data)?;
+    if args.verbose {
+        report_integrity(restored.report.integrity);
+    }
     if args.json {
         eprintln!("{}", summary(&restored));
     }
@@ -137,11 +141,36 @@ fn report_page(outcome: &PageOutcome) {
                 stats.bad_blocks,
                 stats.restored_bytes
             );
+            if let Some(id) = stats.sheet_id {
+                eprintln!("page {number}: sheet {id}");
+            }
+            if stats.misplaced_blocks > 0 {
+                eprintln!(
+                    "page {number}: {} blocks read in the wrong cell were dropped",
+                    stats.misplaced_blocks
+                );
+            }
             for advice in stats.hints.advice() {
                 eprintln!("page {number}: hint: {advice}");
             }
         }
         Err(reason) => eprintln!("page {number}: skipped, {reason}"),
+    }
+}
+
+fn report_integrity(integrity: Integrity) {
+    match integrity {
+        Integrity::Unchecked => {}
+        Integrity::Missing => eprintln!("the pages announce a hash of the file, but none was read"),
+        Integrity::Verified => eprintln!("the file matches the SHA-256 stored on the pages"),
+    }
+}
+
+fn integrity_name(integrity: Integrity) -> &'static str {
+    match integrity {
+        Integrity::Unchecked => "unchecked",
+        Integrity::Missing => "hash not read",
+        Integrity::Verified => "verified",
     }
 }
 
@@ -157,6 +186,9 @@ fn summary(restored: &RestoredFile) -> String {
         "bad_blocks": report.bad_blocks,
         "corrected_bytes": report.restored_bytes,
         "recovered_blocks": report.recovered_blocks,
+        "misplaced_blocks": report.misplaced_blocks,
+        "sheets": report.sheets.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "integrity": integrity_name(report.integrity),
         "hints": report.hints.names(),
     })
     .to_string()

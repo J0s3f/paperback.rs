@@ -106,6 +106,11 @@ pub(crate) struct EncodeArgs {
     #[arg(long)]
     pub(crate) no_text: bool,
 
+    /// Leave out the SHA-256 of the file and the sheet identifier that paperback.rs adds to
+    /// its pages. PaperBack 1.00 and 1.10 read the pages either way.
+    #[arg(long)]
+    pub(crate) no_extensions: bool,
+
     /// Left, right, top and bottom page margins in millimetres.
     #[arg(long, num_args = 4, value_names = ["LEFT", "RIGHT", "TOP", "BOTTOM"])]
     pub(crate) margins_mm: Option<Vec<f64>>,
