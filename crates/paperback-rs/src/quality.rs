@@ -9,6 +9,7 @@
 //! "quality map".
 
 use crate::decode::grid::Grid;
+use crate::decode::mesh::Quad;
 use crate::raster::Raster;
 
 /// Corrections a block can survive; one more and it is unreadable.
@@ -20,6 +21,12 @@ const SATURATION: f64 = 0.85;
 const VALUE: f64 = 0.95;
 const PAPER: [u8; 3] = [255, 255, 255];
 /// Share of the colour in an overlay; the rest is the scan, so the dots stay visible.
+/// Distance in pixels between the points that colour a block.
+const QUAD_PAINT_STEP: f64 = 0.5;
+/// Corners that must have been found in the picture for an unreadable block to be drawn.
+const MIN_CORNERS_TO_PAINT: usize = 3;
+/// All four corners of a block.
+const FULL_QUAD: usize = 4;
 const OVERLAY_STRENGTH: f64 = 0.45;
 
 /// An 8-bit colour picture, rows stored top to bottom.
@@ -82,6 +89,9 @@ pub struct PageQuality {
     cells: Vec<BlockQuality>,
     /// Where each block really sat compared with the grid, in pixels.
     shifts: Vec<(f64, f64)>,
+    /// The four corners of every block (row by row from the top), when they were followed
+    /// across the page; they draw bent paper better than the straight grid and the shifts.
+    quads: Option<Vec<Quad>>,
 }
 
 impl PageQuality {
@@ -92,10 +102,15 @@ impl PageQuality {
         rows: usize,
         mut cells: Vec<BlockQuality>,
         shifts: Vec<(f64, f64)>,
+        quads: Option<Vec<Quad>>,
     ) -> Self {
         debug_assert_eq!(cells.len(), columns * rows);
         debug_assert_eq!(shifts.len(), cells.len());
+        debug_assert!(quads.as_ref().is_none_or(|q| q.len() == cells.len()));
         mark_gaps_as_unreadable(&mut cells, columns);
+        if let Some(quads) = &quads {
+            mark_followed_blocks_as_unreadable(&mut cells, quads);
+        }
         Self {
             page,
             grid,
@@ -103,6 +118,7 @@ impl PageQuality {
             rows,
             cells,
             shifts,
+            quads,
         }
     }
 
@@ -153,6 +169,13 @@ impl PageQuality {
     ) -> ColorImage {
         let (width, height) = (self.page.width(), self.page.height());
         let mut rgb = Vec::with_capacity(width * height * 3);
+        if let Some(quads) = &self.quads {
+            for &gray in self.page.pixels() {
+                rgb.extend_from_slice(&outside(gray));
+            }
+            self.paint_quads(quads, &inside, &mut rgb);
+            return ColorImage { width, height, rgb };
+        }
         for y in 0..height {
             for (x, &gray) in self.page.row(y).iter().enumerate() {
                 let pixel = match self.cell_at(x, y).and_then(BlockQuality::color) {
@@ -164,6 +187,52 @@ impl PageQuality {
         }
         ColorImage { width, height, rgb }
     }
+
+    /// Colours every block by walking over its quadrilateral in steps of half a pixel, which
+    /// leaves no gaps; a pixel on the edge of two blocks takes the colour of the later one.
+    fn paint_quads(
+        &self,
+        quads: &[Quad],
+        inside: &impl Fn(u8, [u8; 3]) -> [u8; 3],
+        rgb: &mut [u8],
+    ) {
+        let (width, height) = (self.page.width(), self.page.height());
+        for (quad, cell) in quads.iter().zip(&self.cells) {
+            let Some(color) = cell.color() else {
+                continue;
+            };
+            // A block whose lines were not found is outside the page, not a damaged block.
+            if quad.corners_found < MIN_CORNERS_TO_PAINT
+                && !matches!(cell, BlockQuality::Readable(_))
+            {
+                continue;
+            }
+            let longest = [
+                (quad.lower_left, quad.lower_right),
+                (quad.upper_left, quad.upper_right),
+                (quad.lower_left, quad.upper_left),
+                (quad.lower_right, quad.upper_right),
+            ]
+            .iter()
+            .map(|(a, b)| (a.0 - b.0).hypot(a.1 - b.1))
+            .fold(0.0, f64::max);
+            let steps = (longest / QUAD_PAINT_STEP).ceil().max(1.0) as usize;
+            for v in 0..=steps {
+                for u in 0..=steps {
+                    let (x, y) = quad.at(u as f64 / steps as f64, v as f64 / steps as f64);
+                    // The decoder's bitmap has its first row at the bottom of the page.
+                    let (px, py) = (x.round(), (height - 1) as f64 - y.round());
+                    if px < 0.0 || py < 0.0 || px >= width as f64 || py >= height as f64 {
+                        continue;
+                    }
+                    let (px, py) = (px as usize, py as usize);
+                    let pixel = inside(self.page.row(py)[px], color);
+                    rgb[(py * width + px) * 3..][..3].copy_from_slice(&pixel);
+                }
+            }
+        }
+    }
+
     /// The block covering a pixel, following the tilt of the grid and the
     /// measured shift of each block (paper that is bent moves its blocks).
     fn cell_at(&self, x: usize, y: usize) -> Option<BlockQuality> {
@@ -236,6 +305,16 @@ fn mark_gaps_as_unreadable(cells: &mut [BlockQuality], columns: usize) {
     }
 }
 
+/// A block that was not read but whose four corners were found along the grid lines is
+/// there, so it is shown as unreadable, also beyond the blocks that were read.
+fn mark_followed_blocks_as_unreadable(cells: &mut [BlockQuality], quads: &[Quad]) {
+    for (cell, quad) in cells.iter_mut().zip(quads) {
+        if *cell == BlockQuality::Absent && quad.corners_found == FULL_QUAD {
+            *cell = BlockQuality::Unreadable;
+        }
+    }
+}
+
 /// Colour for a hue in degrees at the fixed saturation and value.
 fn hsv(hue: f64) -> [u8; 3] {
     let chroma = VALUE * SATURATION;
@@ -273,6 +352,7 @@ mod tests {
             1,
             cells,
             vec![(0.0, 0.0); 2],
+            None,
         )
     }
 
@@ -336,9 +416,43 @@ mod tests {
                 BlockQuality::Readable(0),
             ],
             vec![(0.0, 0.0); 4],
+            None,
         );
         assert_eq!(q.cells[0], BlockQuality::Absent);
         assert_eq!(q.cells[2], BlockQuality::Unreadable);
+    }
+
+    #[test]
+    fn blocks_with_corners_are_painted_inside_their_quadrilateral_only() {
+        // One block as a parallelogram leaning to the right; the picture is 40 x 20 pixels.
+        let quad = Quad::new((4.0, 2.0), (14.0, 2.0), (10.0, 16.0), (20.0, 16.0), 4);
+        let q = PageQuality::new(
+            Raster::filled(40, 20, 100),
+            grid(),
+            1,
+            1,
+            vec![BlockQuality::Readable(0)],
+            vec![(0.0, 0.0)],
+            Some(vec![quad]),
+        );
+        let map = q.map();
+        let green = BlockQuality::Readable(0).color().unwrap();
+        // The bitmap's first row is the bottom: bitmap y 3 is picture row 16, y 16 is row 3.
+        assert_eq!(pixel(&map, 9, 16), green);
+        assert_eq!(
+            pixel(&map, 5, 16),
+            green,
+            "inside at the bottom, where the block starts further left"
+        );
+        assert_eq!(pixel(&map, 12, 3), green);
+        assert_eq!(
+            pixel(&map, 5, 3),
+            PAPER,
+            "outside at the top, where the block starts further right"
+        );
+        assert_eq!(pixel(&map, 30, 10), PAPER);
+        // Left of the leaning edge at half height there is paper, not colour.
+        assert_eq!(pixel(&map, 5, 10), PAPER);
     }
 
     #[test]

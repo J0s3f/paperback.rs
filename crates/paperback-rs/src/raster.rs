@@ -27,6 +27,45 @@ pub fn size_is_allowed(width: usize, height: usize) -> bool {
             .is_some_and(|pixels| pixels <= MAX_PIXELS)
 }
 
+/// How a picture is turned onto a larger canvas, so that a point of the turned picture can be
+/// followed back to the picture it was made from.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Turn {
+    sin: f64,
+    cos: f64,
+    turned_middle: (f64, f64),
+    source_middle: (f64, f64),
+}
+
+impl Turn {
+    /// The turn of a picture of the given size counter-clockwise by `degrees`, and the size of
+    /// the canvas that holds the turned picture.
+    pub(crate) fn new(width: usize, height: usize, degrees: f64) -> (Self, usize, usize) {
+        let (sin, cos) = degrees.to_radians().sin_cos();
+        let (w, h) = (width as f64, height as f64);
+        // The epsilon keeps exact quarter turns from growing by a pixel through rounding error.
+        let new_width = (w * cos.abs() + h * sin.abs() - 1e-9).ceil() as usize;
+        let new_height = (w * sin.abs() + h * cos.abs() - 1e-9).ceil() as usize;
+        let turn = Self {
+            sin,
+            cos,
+            turned_middle: (new_width as f64 / 2.0, new_height as f64 / 2.0),
+            source_middle: (w / 2.0, h / 2.0),
+        };
+        (turn, new_width, new_height)
+    }
+
+    /// Where the point (`x`, `y`) of the turned picture lies in the picture that was turned.
+    pub(crate) fn source_of(&self, x: f64, y: f64) -> (f64, f64) {
+        let dx = x + 0.5 - self.turned_middle.0;
+        let dy = y + 0.5 - self.turned_middle.1;
+        (
+            dx * self.cos - dy * self.sin + self.source_middle.0 - 0.5,
+            dx * self.sin + dy * self.cos + self.source_middle.1 - 0.5,
+        )
+    }
+}
+
 impl Raster {
     /// A picture of a single gray level.
     pub fn filled(width: usize, height: usize, value: u8) -> Self {
@@ -93,23 +132,14 @@ impl Raster {
     /// turned picture would be too large.
     #[allow(clippy::similar_names, reason = "x and y pairs of the same quantity")]
     pub fn rotated(&self, degrees: f64, fill: u8) -> Option<Self> {
-        let (sin, cos) = degrees.to_radians().sin_cos();
-        let (w, h) = (self.width as f64, self.height as f64);
-        // The epsilon keeps exact quarter turns from growing by a pixel through rounding error.
-        let new_width = (w * cos.abs() + h * sin.abs() - 1e-9).ceil() as usize;
-        let new_height = (w * sin.abs() + h * cos.abs() - 1e-9).ceil() as usize;
-        let (dest_cx, dest_cy) = (new_width as f64 / 2.0, new_height as f64 / 2.0);
-        let (src_cx, src_cy) = (w / 2.0, h / 2.0);
+        let (turn, new_width, new_height) = Turn::new(self.width, self.height, degrees);
         if !size_is_allowed(new_width, new_height) {
             return None;
         }
         let mut pixels = Vec::with_capacity(new_width * new_height);
         for y in 0..new_height {
-            let dy = y as f64 + 0.5 - dest_cy;
             for x in 0..new_width {
-                let dx = x as f64 + 0.5 - dest_cx;
-                let source_x = dx * cos - dy * sin + src_cx - 0.5;
-                let source_y = dx * sin + dy * cos + src_cy - 0.5;
+                let (source_x, source_y) = turn.source_of(x as f64, y as f64);
                 pixels.push(self.sample(source_x, source_y).unwrap_or(fill));
             }
         }
@@ -160,6 +190,21 @@ impl Raster {
         Self::from_pixels(width, height, pixels)
     }
 
+    /// The picture with every pixel darker than `light_from` black and every other white.
+    #[must_use]
+    pub fn black_and_white(&self, light_from: u8) -> Self {
+        let pixels = self
+            .pixels
+            .iter()
+            .map(|&pixel| if pixel < light_from { 0 } else { u8::MAX })
+            .collect();
+        Self {
+            width: self.width,
+            height: self.height,
+            pixels,
+        }
+    }
+
     /// The picture upside down.
     #[must_use]
     pub fn flipped_vertically(&self) -> Self {
@@ -178,6 +223,13 @@ impl Raster {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn black_and_white_splits_at_the_given_level() {
+        let gray = Raster::from_pixels(5, 1, vec![0, 64, 128, 191, 255]).unwrap();
+        assert_eq!(gray.black_and_white(192).pixels(), [0, 0, 0, 0, 255]);
+        assert_eq!(gray.black_and_white(100).pixels(), [0, 0, 255, 255, 255]);
+    }
 
     #[test]
     fn fill_rect_is_clipped() {

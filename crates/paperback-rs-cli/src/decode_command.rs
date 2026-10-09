@@ -21,6 +21,7 @@ pub(crate) fn run(args: &DecodeArgs) -> Result<()> {
     let options = DecodeOptions {
         password: password::read(&args.password)?,
         quality: reports.wanted(),
+        diagnose: args.verbose || args.json,
     };
     let restored = decode(&pages, &options, |outcome| {
         if args.verbose {
@@ -129,12 +130,17 @@ fn write_output(path: Option<&Path>, data: &[u8]) -> Result<()> {
 fn report_page(outcome: &PageOutcome) {
     let number = outcome.index + 1;
     match &outcome.result {
-        Ok(stats) => eprintln!(
-            "page {number}: {} blocks read, {} unreadable, {} bytes corrected",
-            stats.good_blocks + stats.superblocks,
-            stats.bad_blocks,
-            stats.restored_bytes
-        ),
+        Ok(stats) => {
+            eprintln!(
+                "page {number}: {} blocks read, {} unreadable, {} bytes corrected",
+                stats.good_blocks + stats.superblocks,
+                stats.bad_blocks,
+                stats.restored_bytes
+            );
+            for advice in stats.hints.advice() {
+                eprintln!("page {number}: hint: {advice}");
+            }
+        }
         Err(reason) => eprintln!("page {number}: skipped, {reason}"),
     }
 }
@@ -151,6 +157,7 @@ fn summary(restored: &RestoredFile) -> String {
         "bad_blocks": report.bad_blocks,
         "corrected_bytes": report.restored_bytes,
         "recovered_blocks": report.recovered_blocks,
+        "hints": report.hints.names(),
     })
     .to_string()
 }

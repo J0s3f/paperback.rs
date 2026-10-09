@@ -89,7 +89,7 @@ fn output_format(format: Format) -> OutputFormat {
 /// One document holding all pages: a PDF, or one image if there is a single page.
 fn single_document(format: OutputFormat, pages: &[Page]) -> Result<Vec<u8>> {
     match (format, pages) {
-        (OutputFormat::Pdf, _) => Ok(imageio::write_pdf(pages)),
+        (OutputFormat::Pdf, _) => Ok(imageio::write_pdf(&printable(pages))),
         (_, [page]) => encode_page(format, page),
         (_, _) => Err(CliError::other(format!(
             "the data needs {} pages; name the output like page-%03d.png or use a .pdf",
@@ -98,11 +98,17 @@ fn single_document(format: OutputFormat, pages: &[Page]) -> Result<Vec<u8>> {
     }
 }
 
+/// PDFs are made for printing, so their pages are pure black and white (see
+/// [`Page::black_and_white`]); PNG and BMP keep the gray levels of the original program.
+fn printable(pages: &[Page]) -> Vec<Page> {
+    pages.iter().map(Page::black_and_white).collect()
+}
+
 fn encode_page(format: OutputFormat, page: &Page) -> Result<Vec<u8>> {
     match format {
         OutputFormat::Png => Ok(imageio::write_png(page)?),
         OutputFormat::Bmp => Ok(imageio::write_bmp(page)),
-        OutputFormat::Pdf => Ok(imageio::write_pdf(std::slice::from_ref(page))),
+        OutputFormat::Pdf => Ok(imageio::write_pdf(&printable(std::slice::from_ref(page)))),
     }
 }
 

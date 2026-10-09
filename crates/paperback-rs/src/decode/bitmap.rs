@@ -24,6 +24,20 @@ impl Bitmap {
         }
     }
 
+    /// The part of the bitmap that starts at (`x0`, `y0`) and is `width` by `height` pixels.
+    pub(crate) fn cropped(&self, x0: usize, y0: usize, width: usize, height: usize) -> Self {
+        let mut pixels = Vec::with_capacity(width * height);
+        for y in y0..y0 + height {
+            let start = y * self.width + x0;
+            pixels.extend_from_slice(&self.pixels[start..start + width]);
+        }
+        Self {
+            width,
+            height,
+            pixels,
+        }
+    }
+
     pub(crate) fn width(&self) -> usize {
         self.width
     }

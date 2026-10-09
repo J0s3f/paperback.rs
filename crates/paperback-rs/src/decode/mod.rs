@@ -12,23 +12,31 @@
 
 mod assemble;
 mod bitmap;
+mod detector;
 pub(crate) mod grid;
+pub mod hints;
+mod known;
+pub(crate) mod mesh;
 mod peaks;
 mod reader;
+mod sheet;
 mod skew;
 
 pub use assemble::{PageStatistics, Report, RestoredFile};
+pub use hints::ScanHints;
 
 use std::collections::{HashMap, HashSet};
 
 use assemble::{Assembler, ScannedBlock, ScannedPage};
 use bitmap::Bitmap;
-use reader::{BlockOutcome, BlockReader};
+use known::{KnownBlocks, Placement};
+use reader::{BlockOutcome, BlockReader, Effort};
+use sheet::{BlockKey, LatticeRead, Relation, Sheets, sample_cells};
 
-use crate::block::{BLOCK_DOTS, BlockKind, MAX_FILE_SIZE, SuperBlock};
+use crate::block::{BLOCK_DOTS, BlockKind, MAX_FILE_SIZE, RawBlock, SuperBlock};
 use crate::error::{Error, Result};
 use crate::quality::{BlockQuality, PageQuality};
-use crate::raster::{Raster, WHITE};
+use crate::raster::{Raster, Turn, WHITE};
 
 /// Dot pitch in pixels the reader works best with. Scans at several times the
 /// dot density are averaged down to it: the dots are then sampled with a window
@@ -41,13 +49,75 @@ fn reduction_factor(grid: &grid::Grid) -> usize {
     (pitch / WORKING_DOT_PITCH + 0.2) as usize
 }
 
+/// The extras of reading a page that cost time or memory, asked for by the caller.
+#[derive(Clone, Copy)]
+struct Wanted {
+    quality: bool,
+    diagnose: bool,
+}
+
+/// Parts of a picture, as shares of its width and height, on which the grid is fitted when
+/// fitting it on the whole picture does not lead to readable blocks. On a page that is bent
+/// or photographed at an angle the lines are the most nearly straight and evenly spaced in
+/// the middle; the rest is followed by the corner mesh.
+const CENTRAL_SHARES: [f64; 5] = [0.7, 0.5, 0.4, 0.3, 0.2];
+
+/// Finds where the grid is: on the whole picture if that reads, else on its middle.
+fn find_grid(bitmap: &Bitmap) -> Result<(grid::Grid, grid::Intensity)> {
+    let whole = grid::locate(bitmap);
+    if let Ok((found, intensity)) = &whole
+        && reads_something(bitmap, *found, *intensity)
+    {
+        return whole;
+    }
+    for share in CENTRAL_SHARES {
+        let (width, height) = (
+            (bitmap.width() as f64 * share) as usize,
+            (bitmap.height() as f64 * share) as usize,
+        );
+        let (left, bottom) = ((bitmap.width() - width) / 2, (bitmap.height() - height) / 2);
+        let middle = bitmap.cropped(left, bottom, width, height);
+        if let Ok((found, intensity)) = grid::locate(&middle) {
+            let found = found.translated(left as f64, bottom as f64);
+            if reads_something(bitmap, found, intensity) {
+                return Ok((found, intensity));
+            }
+        }
+    }
+    whole
+}
+
+fn reads_something(bitmap: &Bitmap, found: grid::Grid, intensity: grid::Intensity) -> bool {
+    BlockReader::new(bitmap, found, intensity).finds_blocks(PROBE_COLUMNS, PROBE_ROWS)
+}
+
 /// Reads the bitmap as it is: grid search, then every block.
-fn scan_bitmap(raster: &Raster, with_quality: bool) -> Result<ScannedPage> {
+/// What reading a picture that is a transformation of the original needs to know about it.
+#[derive(Clone)]
+struct Reading<'a> {
+    wanted: Wanted,
+    /// How the picture relates to the one the caller gave.
+    placement: Placement,
+    /// Where blocks were read in the original already; they are not read again.
+    known: &'a KnownBlocks,
+    /// The label found by an earlier reading.
+    label: Option<SuperBlock>,
+    /// Blocks read from other pictures of the same sheet.
+    sheets: &'a Sheets,
+}
+
+/// Share of a block's size within which a block read before counts as the one in this cell.
+const SAME_BLOCK_SHARE: f64 = 0.4;
+
+fn scan_bitmap(raster: &Raster, reading: &Reading, reduced_by: usize) -> Result<ScannedPage> {
+    let wanted = reading.wanted;
     let bitmap = Bitmap::from_raster(raster);
-    let (grid, intensity) = grid::locate(&bitmap)?;
+    let (grid, intensity) = find_grid(&bitmap)?;
     let factor = reduction_factor(&grid);
     if let Some(smaller) = raster.reduced(factor).filter(|_| factor > 1) {
-        return scan_bitmap(&smaller, with_quality);
+        let mut page = scan_bitmap(&smaller, reading, factor)?;
+        attach_hints(&mut page, raster, dot_pitch(&grid), wanted);
+        return Ok(page);
     }
     let mut reader = BlockReader::new(&bitmap, grid, intensity);
     reader.tune_sharpness(TUNING_COLUMNS, TUNING_ROWS);
@@ -55,104 +125,342 @@ fn scan_bitmap(raster: &Raster, with_quality: bool) -> Result<ScannedPage> {
         return Err(Error::Decode("no readable blocks found in the grid".into()));
     }
 
-    let mut label: Option<SuperBlock> = None;
-    let mut group_size = 0;
-    let mut blocks = Vec::new();
-    let mut statistics = PageStatistics::default();
     let (columns, rows) = (reader.columns(), reader.rows());
-    let mut cells = vec![BlockQuality::Absent; columns * rows];
-    let mut outcomes: Vec<BlockOutcome> = (0..rows)
-        .flat_map(|row| (0..columns).map(move |column| (column, row)))
-        .map(|(column, row)| reader.read(column, row))
-        .collect();
-    follow_bent_paper(&mut reader, &mut outcomes, columns, rows);
-    for row in 0..rows {
-        for column in 0..columns {
-            let outcome =
-                std::mem::replace(&mut outcomes[row * columns + column], BlockOutcome::Missing);
-            cells[row * columns + column] = match &outcome {
-                BlockOutcome::Missing => BlockQuality::Absent,
-                BlockOutcome::Unreadable => BlockQuality::Unreadable,
-                BlockOutcome::Readable { corrected, .. } => BlockQuality::Readable(*corrected),
-            };
-            match outcome {
-                BlockOutcome::Missing => {}
-                BlockOutcome::Unreadable => statistics.bad_blocks += 1,
-                BlockOutcome::Readable { block, corrected } => {
-                    statistics.restored_bytes += corrected;
-                    match BlockKind::of(block.address()) {
-                        BlockKind::Superblock => {
-                            let candidate = SuperBlock::from_raw(&block);
-                            if label_is_plausible(&candidate) {
-                                label = Some(candidate);
-                            }
-                            statistics.superblocks += 1;
-                        }
-                        BlockKind::Data { offset } => {
-                            statistics.good_blocks += 1;
-                            blocks.push(ScannedBlock::Data {
-                                offset,
-                                payload: block.payload_array(),
-                            });
-                        }
-                        BlockKind::Recovery {
-                            offset,
-                            group_size: size,
-                        } => {
-                            statistics.good_blocks += 1;
-                            group_size = size;
-                            blocks.push(ScannedBlock::Recovery {
-                                offset,
-                                group_size: size,
-                                payload: block.payload_array(),
-                            });
-                        }
-                    }
-                }
-            }
+    let height = bitmap.height() as f64;
+    let in_original = |point: (f64, f64)| {
+        // The bitmap's first row is the bottom of the picture.
+        reading
+            .placement
+            .to_original((point.0, height - 1.0 - point.1), reduced_by)
+    };
+    let block_size = reader.grid().x_step.min(reader.grid().y_step) * reduced_by as f64;
+    let (mut outcomes, sheet) = quick_pass(
+        &mut reader,
+        reading,
+        (columns, rows),
+        in_original,
+        SAME_BLOCK_SHARE * block_size,
+    );
+    // Then passes of more effort over the blocks that are still missing, and only those.
+    for effort in [Effort::Normal, Effort::Deep] {
+        reader.set_effort(effort);
+        if effort == Effort::Deep {
+            train_detector(&mut reader, &mut outcomes, columns);
         }
+        follow_bent_paper(&mut reader, &mut outcomes, columns, rows);
     }
-    let label = label.ok_or(Error::NoReadablePage)?;
-    let quality = with_quality.then(|| {
+    let collected = collect(
+        outcomes,
+        columns,
+        |column, row| reader.read_position(column, row).map(in_original),
+        |column, row| in_original(reader.cell_centre(column, row)),
+    );
+    // The label of an earlier reading serves a reading that skipped the cells that held it.
+    let label = collected
+        .label
+        .or_else(|| reading.label.clone())
+        // A picture that shows no label block but is found to show a sheet read before.
+        .or_else(|| sheet.map(|(index, _)| reading.sheets.label_of(index)))
+        .ok_or(Error::NoReadablePage)?;
+    let quality = wanted.quality.then(|| {
         PageQuality::new(
             raster.clone(),
             reader.grid(),
             columns,
             rows,
-            cells,
+            collected.cells,
             reader.shift_map(),
+            reader.cell_quads(),
         )
     });
-    Ok(ScannedPage {
+    let mut page = ScannedPage {
         label,
-        group_size,
-        blocks,
-        statistics,
+        group_size: collected.group_size,
+        blocks: collected.blocks,
+        statistics: collected.statistics,
+        read_places: collected.read_places,
+        block_size,
+        lattice: LatticeRead {
+            columns,
+            rows,
+            keys: collected.keys,
+            sheet,
+        },
         quality,
-    })
+    };
+    // A reduced picture shows nothing of the scanner's settings; the caller looks at the original.
+    if reduced_by == 1 {
+        attach_hints(&mut page, raster, dot_pitch(&reader.grid()), wanted);
+    }
+    Ok(page)
+}
+
+/// Blocks read in the first look at a picture; more would only cost time.
+const ENOUGH_SAMPLES: usize = 6;
+
+/// The first pass over all cells of a picture at the lowest effort, skipping the cells where a
+/// block was read already: in an earlier reading of this picture, or in another picture of the
+/// sheet. A first look at a few cells says whether other pictures of the sheet were read and
+/// how their cells relate to these. Also returns the sheet the picture was found to show.
+fn quick_pass(
+    reader: &mut BlockReader,
+    reading: &Reading,
+    (columns, rows): (usize, usize),
+    in_original: impl Fn((f64, f64)) -> (f64, f64),
+    same_block_within: f64,
+) -> (Vec<BlockOutcome>, Option<(usize, Relation)>) {
+    let mut first_look: Vec<Option<BlockOutcome>> = (0..columns * rows).map(|_| None).collect();
+    let mut samples: Vec<((usize, usize), BlockKey)> = Vec::new();
+    if !reading.sheets.is_empty() {
+        // The cells must read, so these few are read with more effort than the quick pass gives.
+        reader.set_effort(Effort::Normal);
+        for (column, row) in sample_cells(columns, rows) {
+            if samples.len() >= ENOUGH_SAMPLES {
+                break;
+            }
+            let place = in_original(reader.cell_centre(column, row));
+            if reading.known.is_near(place, same_block_within) {
+                continue;
+            }
+            let outcome = reader.read(column, row);
+            if let BlockOutcome::Readable { block, .. } = &outcome
+                && let Some(key) = block_key(block)
+            {
+                samples.push(((column, row), key));
+            }
+            first_look[row * columns + column] = Some(outcome);
+        }
+        reader.set_effort(Effort::Quick);
+    }
+    let sheet = reading.sheets.recognise(&samples);
+    let known_in_sheet = sheet.map(|found| reading.sheets.known_cells(found, columns, rows));
+    let mut outcomes: Vec<BlockOutcome> = Vec::with_capacity(columns * rows);
+    for row in 0..rows {
+        for column in 0..columns {
+            let at = row * columns + column;
+            let place = in_original(reader.cell_centre(column, row));
+            outcomes.push(if let Some(done) = first_look[at].take() {
+                done
+            } else if reading.known.is_near(place, same_block_within)
+                || known_in_sheet.as_ref().is_some_and(|known| known[at])
+            {
+                BlockOutcome::Skipped
+            } else {
+                reader.read(column, row)
+            });
+        }
+    }
+    (outcomes, sheet)
+}
+
+/// What the outcomes of reading all cells of a page add up to.
+struct Collected {
+    label: Option<SuperBlock>,
+    group_size: usize,
+    blocks: Vec<ScannedBlock>,
+    statistics: PageStatistics,
+    cells: Vec<BlockQuality>,
+    /// Where in the original picture blocks were read.
+    read_places: Vec<(f64, f64)>,
+    /// The key of the block read in each cell.
+    keys: Vec<Option<BlockKey>>,
+}
+
+/// Sorts the blocks that were read into data, recovery and label, and counts the rest.
+/// `place_of` tells where in the original picture the block of a cell was read, `centre_of`
+/// where the cell is.
+fn collect(
+    outcomes: Vec<BlockOutcome>,
+    columns: usize,
+    place_of: impl Fn(usize, usize) -> Option<(f64, f64)>,
+    centre_of: impl Fn(usize, usize) -> (f64, f64),
+) -> Collected {
+    let mut collected = Collected {
+        label: None,
+        group_size: 0,
+        blocks: Vec::new(),
+        statistics: PageStatistics::default(),
+        cells: Vec::with_capacity(outcomes.len()),
+        read_places: Vec::new(),
+        keys: Vec::with_capacity(outcomes.len()),
+    };
+    for (at, outcome) in outcomes.into_iter().enumerate() {
+        let (column, row) = (at % columns, at / columns);
+        collected.cells.push(match &outcome {
+            BlockOutcome::Missing | BlockOutcome::Skipped => BlockQuality::Absent,
+            BlockOutcome::Unreadable => BlockQuality::Unreadable,
+            BlockOutcome::Readable { corrected, .. } => BlockQuality::Readable(*corrected),
+        });
+        collected.keys.push(match &outcome {
+            BlockOutcome::Readable { block, .. } => block_key(block),
+            _ => None,
+        });
+        match outcome {
+            BlockOutcome::Missing => {}
+            // A block known from elsewhere: a later reading need not read this place either.
+            BlockOutcome::Skipped => collected.read_places.push(centre_of(column, row)),
+            BlockOutcome::Unreadable => collected.statistics.bad_blocks += 1,
+            BlockOutcome::Readable { block, corrected } => {
+                collected.read_places.extend(place_of(column, row));
+                collected.statistics.restored_bytes += corrected;
+                collected.sort_block(&block);
+            }
+        }
+    }
+    collected
+}
+
+/// Where a block belongs in the file; `None` for labels, which every string carries.
+fn block_key(block: &RawBlock) -> Option<BlockKey> {
+    match BlockKind::of(block.address()) {
+        BlockKind::Superblock => None,
+        BlockKind::Data { offset } => Some((false, offset)),
+        BlockKind::Recovery { offset, .. } => Some((true, offset)),
+    }
+}
+
+impl Collected {
+    fn sort_block(&mut self, block: &RawBlock) {
+        match BlockKind::of(block.address()) {
+            BlockKind::Superblock => {
+                let candidate = SuperBlock::from_raw(block);
+                if label_is_plausible(&candidate) {
+                    self.label = Some(candidate);
+                }
+                self.statistics.superblocks += 1;
+            }
+            BlockKind::Data { offset } => {
+                self.statistics.good_blocks += 1;
+                self.blocks.push(ScannedBlock::Data {
+                    offset,
+                    payload: block.payload_array(),
+                });
+            }
+            BlockKind::Recovery { offset, group_size } => {
+                self.statistics.good_blocks += 1;
+                self.group_size = group_size;
+                self.blocks.push(ScannedBlock::Recovery {
+                    offset,
+                    group_size,
+                    payload: block.payload_array(),
+                });
+            }
+        }
+    }
+}
+
+/// Pixels between two dots in a picture with this grid.
+fn dot_pitch(grid: &grid::Grid) -> f64 {
+    grid.x_step.min(grid.y_step) / (BLOCK_DOTS + 3) as f64
+}
+
+/// More corrected bytes per block than this is a page that read with difficulty.
+const TROUBLE_CORRECTIONS_PER_BLOCK: usize = 4;
+
+/// Diagnoses the scan, but only for pages that read badly: a page that read cleanly needs no advice.
+fn attach_hints(page: &mut ScannedPage, raster: &Raster, pixels_per_dot: f64, wanted: Wanted) {
+    if !wanted.diagnose {
+        return;
+    }
+    let stats = &page.statistics;
+    let blocks = stats.good_blocks.max(1);
+    let in_trouble =
+        stats.bad_blocks > 0 || stats.restored_bytes > TROUBLE_CORRECTIONS_PER_BLOCK * blocks;
+    if in_trouble {
+        page.statistics.hints = hints::assess(raster, pixels_per_dot);
+    }
 }
 
 /// Rounds of rereading blocks next to ones that read, so that a crease is
 /// followed block by block from its readable edge inwards.
 const FOLLOW_ROUNDS: usize = 64;
 
-/// Rereads unreadable blocks at the position their readable neighbours show.
+/// How many of the cells around (`column`, `row`) hold a block that was read.
+fn readable_neighbours(
+    outcomes: &[BlockOutcome],
+    (column, row): (usize, usize),
+    (columns, rows): (usize, usize),
+) -> usize {
+    (row.saturating_sub(1)..=(row + 1).min(rows - 1))
+        .flat_map(|r| {
+            (column.saturating_sub(1)..=(column + 1).min(columns - 1)).map(move |c| (c, r))
+        })
+        .filter(|&(c, r)| (c, r) != (column, row))
+        .filter(|&(c, r)| matches!(outcomes[r * columns + c], BlockOutcome::Readable { .. }))
+        .count()
+}
+
+/// Reads the cells around (`column`, `row`) that were skipped as already known, for what they
+/// tell about the page; the block is the same one and is not added a second time.
+fn read_skipped_neighbours(
+    reader: &mut BlockReader,
+    outcomes: &mut [BlockOutcome],
+    (column, row): (usize, usize),
+    (columns, rows): (usize, usize),
+) {
+    for r in row.saturating_sub(1)..=(row + 1).min(rows - 1) {
+        for c in column.saturating_sub(1)..=(column + 1).min(columns - 1) {
+            if matches!(outcomes[r * columns + c], BlockOutcome::Skipped) {
+                outcomes[r * columns + c] = reader.read(c, r);
+            }
+        }
+    }
+}
+
+/// Blocks read in order to teach the detector what dots look like on this page, when too few
+/// were read in this reading.
+const TRAINING_BLOCKS: usize = 6;
+
+/// Reads a few of the skipped cells while the detector knows too little, so that what it
+/// learns serves the blocks that are missing.
+fn train_detector(reader: &mut BlockReader, outcomes: &mut [BlockOutcome], columns: usize) {
+    let mut read = 0;
+    for at in 0..outcomes.len() {
+        if read >= TRAINING_BLOCKS || !reader.detector_needs_blocks() {
+            break;
+        }
+        if matches!(outcomes[at], BlockOutcome::Skipped) {
+            outcomes[at] = reader.read(at % columns, at / columns);
+            read += 1;
+        }
+    }
+}
+
+/// Rereads the blocks that are still missing, at the effort the reader is set to and at
+/// the positions their readable neighbours show; blocks that were read are left alone.
 fn follow_bent_paper(
     reader: &mut BlockReader,
     outcomes: &mut [BlockOutcome],
     columns: usize,
     rows: usize,
 ) {
+    // What a block's neighbours told when it was last tried; trying again is of use only when
+    // more neighbours have been read since.
+    let mut tried_with = vec![usize::MAX; outcomes.len()];
     for _ in 0..FOLLOW_ROUNDS {
         let mut improved = false;
         for row in 0..rows {
             for column in 0..columns {
                 let at = row * columns + column;
-                if matches!(outcomes[at], BlockOutcome::Readable { .. })
-                    || !reader.has_neighbour_to_learn_from(column, row)
-                {
+                let worth_retrying = match outcomes[at] {
+                    BlockOutcome::Readable { .. } | BlockOutcome::Skipped => false,
+                    BlockOutcome::Unreadable => true,
+                    BlockOutcome::Missing => {
+                        reader.has_neighbour_to_learn_from(column, row)
+                            || reader.mesh_covers(column, row)
+                    }
+                };
+                if !worth_retrying {
                     continue;
                 }
+                let readable_around = readable_neighbours(outcomes, (column, row), (columns, rows));
+                if tried_with[at] == readable_around {
+                    continue;
+                }
+                tried_with[at] = readable_around;
+                // The neighbours' positions and rotations guide the retry: those that were not
+                // read in this reading, because a block was read there before, are read now.
+                read_skipped_neighbours(reader, outcomes, (column, row), (columns, rows));
                 let retry = reader.read(column, row);
                 if matches!(retry, BlockOutcome::Readable { .. }) {
                     improved = true;
@@ -222,34 +530,70 @@ fn reads_cleanly(page: &ScannedPage) -> bool {
     })
 }
 
-/// Reads one page image into blocks and their statistics. When the page does
-/// not read completely as it is, it is turned and read again; blocks found in
-/// any attempt are combined.
-fn scan_page(raster: &Raster, with_quality: bool) -> Result<ScannedPage> {
-    let mut combined: Option<ScannedPage> = None;
-    let mut last_error = None;
-    let mut attempt = |page: Result<ScannedPage>| -> Option<ScannedPage> {
+/// The places where blocks were read in the attempts so far.
+fn known_blocks(page: Option<&ScannedPage>) -> KnownBlocks {
+    let Some(page) = page else {
+        return KnownBlocks::default();
+    };
+    let mut known = KnownBlocks::new(page.block_size);
+    for &place in &page.read_places {
+        known.add(place);
+    }
+    known
+}
+
+/// The readings of one page so far: the blocks of all of them, and the last failure.
+#[derive(Default)]
+struct Readings {
+    combined: Option<ScannedPage>,
+    last_error: Option<Error>,
+}
+
+impl Readings {
+    /// Adds a reading; whether the page is complete now.
+    fn add(&mut self, page: Result<ScannedPage>) -> bool {
         match page {
             Ok(page) => {
-                let merged = match combined.take() {
+                let merged = match self.combined.take() {
                     Some(mut earlier) => {
                         earlier.absorb(page);
                         earlier
                     }
                     None => page,
                 };
-                if reads_cleanly(&merged) {
-                    return Some(merged);
-                }
-                combined = Some(merged);
+                let complete = reads_cleanly(&merged);
+                self.combined = Some(merged);
+                complete
             }
-            Err(error) => last_error = Some(error),
+            Err(error) => {
+                self.last_error = Some(error);
+                false
+            }
         }
-        None
-    };
+    }
 
-    if let Some(page) = attempt(scan_bitmap(raster, with_quality)) {
-        return Ok(page);
+    fn into_result(self) -> Result<ScannedPage> {
+        self.combined
+            .ok_or_else(|| self.last_error.unwrap_or(Error::NoReadablePage))
+    }
+}
+
+/// Reads one page image into blocks and their statistics. When the page does
+/// not read completely as it is, it is turned and read again; blocks found in
+/// any attempt are combined. A turned picture is read only where no block was read
+/// before, and nothing that was read is ever dropped.
+fn scan_page(raster: &Raster, wanted: Wanted, sheets: &Sheets) -> Result<ScannedPage> {
+    let mut readings = Readings::default();
+    let nothing_known = KnownBlocks::default();
+    let first = Reading {
+        wanted,
+        placement: Placement::default(),
+        known: &nothing_known,
+        label: None,
+        sheets,
+    };
+    if readings.add(scan_bitmap(raster, &first, 1)) {
+        return readings.into_result();
     }
     let skew = skew::estimate(raster);
     let angles = std::iter::once(skew).chain(NUDGES.iter().map(|nudge| skew + nudge));
@@ -260,12 +604,22 @@ fn scan_page(raster: &Raster, with_quality: bool) -> Result<ScannedPage> {
         let Some(turned) = raster.rotated(degrees, WHITE) else {
             continue;
         };
-        if let Some(page) = attempt(scan_bitmap(&turned, with_quality)) {
-            return Ok(page);
+        let known = known_blocks(readings.combined.as_ref());
+        let (turn, _, _) = Turn::new(raster.width(), raster.height(), degrees);
+        let turned_reading = Reading {
+            wanted,
+            placement: Placement::turned(turn),
+            known: &known,
+            label: readings.combined.as_ref().map(|page| page.label.clone()),
+            sheets,
+        };
+        if readings.add(scan_bitmap(&turned, &turned_reading, 1)) {
+            break;
         }
     }
-    combined.ok_or_else(|| last_error.unwrap_or(Error::NoReadablePage))
+    readings.into_result()
 }
+
 /// A label that passes its CRC can still be garbage or hostile; sizes beyond what
 /// the format can address would only make the assembler allocate absurd amounts.
 fn label_is_plausible(label: &SuperBlock) -> bool {
@@ -293,6 +647,9 @@ pub struct DecodeOptions {
     pub password: Option<String>,
     /// Keep the block quality of every page (see [`PageOutcome::quality`]); costs a copy of each page.
     pub quality: bool,
+    /// Look at pages that read badly for likely causes (see [`PageStatistics::hints`]); costs a
+    /// pass over the pixels of each such page.
+    pub diagnose: bool,
 }
 
 /// Decodes the given pages (in any order) into the original file. Unreadable
@@ -304,9 +661,27 @@ pub fn decode(
     mut on_page: impl FnMut(PageOutcome),
 ) -> Result<RestoredFile> {
     let mut assembler = Assembler::new();
+    let mut sheets = Sheets::default();
     for (index, raster) in pages.iter().enumerate() {
-        match scan_page(raster, options.quality) {
+        // Pictures after the one that completed the file are not read at all.
+        if assembler.is_complete() {
+            on_page(PageOutcome {
+                index,
+                result: Err("not read: the file is complete already".into()),
+                quality: None,
+            });
+            continue;
+        }
+        match scan_page(
+            raster,
+            Wanted {
+                quality: options.quality,
+                diagnose: options.diagnose,
+            },
+            &sheets,
+        ) {
             Ok(mut page) => {
+                sheets.record(&page.lattice, &page.label);
                 on_page(PageOutcome {
                     index,
                     result: Ok(page.statistics),

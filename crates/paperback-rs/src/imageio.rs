@@ -201,16 +201,39 @@ pub fn write_pdf(pages: &[Page]) -> Vec<u8> {
         content.restore_state();
         pdf.stream(content_id, &content.finish());
 
-        let packed = compress_to_vec_zlib(page.raster.pixels(), PDF_COMPRESSION_LEVEL);
-        let mut image = pdf.image_xobject(image_id, &packed);
+        // Pages made of black and white dots only need one bit per pixel: eight times fewer
+        // samples to store, and nothing gray for a viewer or printer driver to smooth.
+        let (samples, bits) = match pack_black_and_white(&page.raster) {
+            Some(packed) => (packed, 1),
+            None => (page.raster.pixels().to_vec(), 8),
+        };
+        let compressed = compress_to_vec_zlib(&samples, PDF_COMPRESSION_LEVEL);
+        let mut image = pdf.image_xobject(image_id, &compressed);
         image.filter(Filter::FlateDecode);
         image.width(page.raster.width() as i32);
         image.height(page.raster.height() as i32);
         image.color_space().device_gray();
-        image.bits_per_component(8);
+        image.bits_per_component(bits);
         image.finish();
     }
     pdf.finish()
+}
+
+/// The rows of a picture with only black (0) and white (255) pixels, one bit per pixel with
+/// every row starting on a byte boundary, as a PDF image wants them; `None` if any pixel is gray.
+fn pack_black_and_white(raster: &Raster) -> Option<Vec<u8>> {
+    let row_bytes = raster.width().div_ceil(8);
+    let mut packed = vec![0u8; row_bytes * raster.height()];
+    for y in 0..raster.height() {
+        for (x, &pixel) in raster.row(y).iter().enumerate() {
+            match pixel {
+                0 => {}
+                255 => packed[y * row_bytes + x / 8] |= 0x80 >> (x % 8),
+                _ => return None,
+            }
+        }
+    }
+    Some(packed)
 }
 
 #[cfg(test)]
@@ -251,6 +274,49 @@ mod tests {
         let pdf = write_pdf(&[first.clone(), second.clone()]);
         let pages = read_pages(&pdf).unwrap();
         assert_eq!(pages, vec![first.raster, second.raster]);
+    }
+
+    /// Black and white dots in an irregular pattern, as real pages have them.
+    fn dot_page(width: usize, height: usize) -> Page {
+        let mut state = 12345u32;
+        let pixels: Vec<u8> = (0..width * height)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                if state >> 24 < 110 { 0 } else { 255 }
+            })
+            .collect();
+        Page {
+            raster: Raster::from_pixels(width, height, pixels).unwrap(),
+            dpi: 600,
+        }
+    }
+
+    #[test]
+    fn black_and_white_pages_are_stored_with_one_bit_per_pixel() {
+        // 61 pixels wide: the rows do not end on a byte boundary.
+        let page = dot_page(61, 40);
+        let pdf = write_pdf(std::slice::from_ref(&page));
+        let text = String::from_utf8_lossy(&pdf);
+        assert!(
+            text.contains(
+                "/BitsPerComponent 1
+"
+            ) || text.contains("/BitsPerComponent 1 "),
+            "no 1-bit image in the PDF"
+        );
+        assert_eq!(read_pages(&pdf).unwrap(), vec![page.raster]);
+    }
+
+    #[test]
+    fn one_bit_pages_make_smaller_pdfs_than_gray_ones() {
+        let black_and_white = dot_page(400, 400);
+        let mut gray = dot_page(400, 400);
+        let mut pixels = gray.raster.pixels().to_vec();
+        pixels[0] = 128;
+        gray.raster = Raster::from_pixels(400, 400, pixels).unwrap();
+        let small = write_pdf(&[black_and_white]).len();
+        let large = write_pdf(&[gray]).len();
+        assert!(small < large, "{small} against {large}");
     }
 
     #[test]

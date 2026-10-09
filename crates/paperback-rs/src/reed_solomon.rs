@@ -77,11 +77,26 @@ pub(crate) fn encode(data: &[u8], pad: usize) -> [u8; PARITY_LEN] {
 /// Corrects `data` (message followed by parity, `CODEWORD_LEN - pad` bytes) in
 /// place. Returns the number of corrected bytes, or `None` if the block is
 /// beyond repair.
+pub(crate) fn decode(data: &mut [u8], pad: usize) -> Option<usize> {
+    decode_with_erasures(data, pad, &[])
+}
+
+/// Like [`decode`], for bytes at known positions that are probably damaged (their dots
+/// were hard to read). Such an erasure costs one parity byte instead of two, so with `e`
+/// erasures up to `(32 - e) / 2` further errors can be corrected. `erasures` are indices
+/// into `data`; the contents at those positions do not matter.
 #[allow(
     clippy::too_many_lines,
     reason = "a close port of the original routine; splitting it would hide the correspondence"
 )]
-pub(crate) fn decode(data: &mut [u8], pad: usize) -> Option<usize> {
+pub(crate) fn decode_with_erasures(
+    data: &mut [u8],
+    pad: usize,
+    erasures: &[usize],
+) -> Option<usize> {
+    if erasures.len() > PARITY_LEN || erasures.iter().any(|&at| at >= CODEWORD_LEN - pad) {
+        return None;
+    }
     let Field { alpha, index } = field();
     let log = |value: u8| index[value as usize];
     let exp = |power: usize| alpha[power % FIELD_ORDER];
@@ -108,13 +123,25 @@ pub(crate) fn decode(data: &mut [u8], pad: usize) -> Option<usize> {
 
     let mut lambda = [0u8; PARITY_LEN + 1];
     lambda[0] = 1;
+    // The erasure locator polynomial is the starting point of the search for the others.
+    if let Some((&first, others)) = erasures.split_first() {
+        lambda[1] = exp(ROOT_STEP * (CODEWORD_LEN - 1 - (first + pad)));
+        for (done, &at) in others.iter().enumerate() {
+            let u = ROOT_STEP * (CODEWORD_LEN - 1 - (at + pad));
+            for j in (1..=done + 2).rev() {
+                if lambda[j - 1] != 0 {
+                    lambda[j] ^= exp(u + log(lambda[j - 1]) as usize);
+                }
+            }
+        }
+    }
     let mut b = [0u8; PARITY_LEN + 1];
     for i in 0..=PARITY_LEN {
         b[i] = log(lambda[i]);
     }
     let mut t = [0u8; PARITY_LEN + 1];
-    let mut el = 0usize;
-    for r in 1..=PARITY_LEN {
+    let mut el = erasures.len();
+    for r in erasures.len() + 1..=PARITY_LEN {
         let mut discrepancy = 0u8;
         for i in 0..r {
             if lambda[i] != 0 && syndrome[r - i - 1] != ZERO_LOG {
@@ -134,8 +161,8 @@ pub(crate) fn decode(data: &mut [u8], pad: usize) -> Option<usize> {
                     lambda[i + 1] ^ exp(discrepancy as usize + b[i] as usize)
                 };
             }
-            if 2 * el < r {
-                el = r - el;
+            if 2 * el < r + erasures.len() {
+                el = r + erasures.len() - el;
                 for i in 0..=PARITY_LEN {
                     b[i] = if lambda[i] == 0 {
                         ZERO_LOG
@@ -253,6 +280,52 @@ mod tests {
         );
         assert_eq!(alpha[254], 0xc3);
         assert_eq!(&index[..8], &[255, 0, 1, 99, 2, 198, 100, 106]);
+    }
+
+    #[test]
+    fn corrects_thirty_two_erased_bytes_at_known_positions() {
+        let original = sample_codeword();
+        let mut damaged = original;
+        let erased: Vec<usize> = (0..32).map(|i| i * 4 + 1).collect();
+        for &at in &erased {
+            damaged[at] ^= 0xA5;
+        }
+        assert!(decode_with_erasures(&mut damaged, PAD, &erased).is_some());
+        assert_eq!(damaged, original);
+    }
+
+    #[test]
+    fn corrects_erasures_together_with_unknown_errors() {
+        // 20 erasures use 20 parity bytes, the other 12 cover 6 unknown errors.
+        let original = sample_codeword();
+        let mut damaged = original;
+        let erased: Vec<usize> = (0..20).map(|i| i * 6).collect();
+        for &at in &erased {
+            damaged[at] ^= 0x3C;
+        }
+        for at in [3, 11, 29, 47, 71, 101] {
+            damaged[at] ^= 0x81;
+        }
+        assert!(decode_with_erasures(&mut damaged, PAD, &erased).is_some());
+        assert_eq!(damaged, original);
+    }
+
+    #[test]
+    fn erasures_that_were_not_damaged_are_harmless() {
+        let original = sample_codeword();
+        let mut block = original;
+        block[40] ^= 0x11;
+        assert!(decode_with_erasures(&mut block, PAD, &[5, 40, 90]).is_some());
+        assert_eq!(block, original);
+    }
+
+    #[test]
+    fn too_many_unknown_errors_are_still_refused() {
+        let mut damaged = sample_codeword();
+        for i in 0..20 {
+            damaged[i * 5] ^= 0x77;
+        }
+        assert_eq!(decode_with_erasures(&mut damaged, PAD, &[1, 2]), None);
     }
 
     #[test]

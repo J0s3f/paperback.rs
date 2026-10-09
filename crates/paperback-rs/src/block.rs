@@ -106,6 +106,11 @@ impl RawBlock {
         reed_solomon::decode(&mut self.0, ECC_PAD)
     }
 
+    /// Repairs the block in place when the bytes at `erased` are probably the damaged ones.
+    pub(crate) fn correct_erasing(&mut self, erased: &[usize]) -> Option<usize> {
+        reed_solomon::decode_with_erasures(&mut self.0, ECC_PAD, erased)
+    }
+
     /// The 32 rows of 32 dots, bit 0 of each row being the leftmost dot.
     pub(crate) fn rows(&self) -> [u32; BLOCK_DOTS] {
         std::array::from_fn(|row| {

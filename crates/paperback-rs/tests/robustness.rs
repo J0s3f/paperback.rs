@@ -147,3 +147,118 @@ fn quality_pictures_show_damage_and_cover_the_page() {
         );
     }
 }
+
+/// Moves every pixel by a smooth, position-dependent amount, like paper that is bent or
+/// photographed from the side. The picture is resampled bilinearly, as a real scan is.
+fn bent(raster: &Raster, amplitude: f64) -> Raster {
+    let (w, h) = (raster.width(), raster.height());
+    let at = |x: usize, y: usize| f64::from(raster.row(y)[x]);
+    let mut pixels = Vec::with_capacity(w * h);
+    for y in 0..h {
+        for x in 0..w {
+            let (u, v) = (x as f64 / w as f64, y as f64 / h as f64);
+            let tau = std::f64::consts::TAU;
+            let dx = amplitude * (tau * (1.4 * v + 0.2)).sin() * (0.3 + u);
+            let dy = amplitude * (tau * (1.1 * u + 0.4)).sin() * (0.3 + v);
+            let (sx, sy) = (x as f64 + dx, y as f64 + dy);
+            let value = if sx < 0.0 || sy < 0.0 || sx >= (w - 1) as f64 || sy >= (h - 1) as f64 {
+                f64::from(WHITE)
+            } else {
+                let (x0, y0) = (sx as usize, sy as usize);
+                let (fx, fy) = (sx - x0 as f64, sy - y0 as f64);
+                let top = at(x0, y0) * (1.0 - fx) + at(x0 + 1, y0) * fx;
+                let bottom = at(x0, y0 + 1) * (1.0 - fx) + at(x0 + 1, y0 + 1) * fx;
+                top * (1.0 - fy) + bottom * fy
+            };
+            pixels.push(value.round() as u8);
+        }
+    }
+    Raster::from_pixels(w, h, pixels).unwrap()
+}
+
+/// The page as a camera sees it from below: the upper edge is farther away, so it looks
+/// shorter and the lines near it are closer together. `farness` is how much farther the
+/// upper edge is than the lower one (0 is a straight-on view).
+fn foreshortened(raster: &Raster, farness: f64) -> Raster {
+    let (w, h) = (raster.width(), raster.height());
+    let at = |x: usize, y: usize| f64::from(raster.row(y)[x]);
+    let mut pixels = Vec::with_capacity(w * h);
+    for y in 0..h {
+        let v = y as f64 / h as f64;
+        // The page row that lands on this picture row (the inverse of a projective mapping).
+        let page_v = v * (1.0 + farness) / (1.0 + farness * v);
+        let width_scale = 1.0 + farness * (1.0 - page_v);
+        for x in 0..w {
+            let u = x as f64 / w as f64 - 0.5;
+            let (sx, sy) = ((u * width_scale + 0.5) * w as f64, page_v * h as f64);
+            let value = if sx < 0.0 || sy < 0.0 || sx >= (w - 1) as f64 || sy >= (h - 1) as f64 {
+                f64::from(WHITE)
+            } else {
+                let (x0, y0) = (sx as usize, sy as usize);
+                let (fx, fy) = (sx - x0 as f64, sy - y0 as f64);
+                let top = at(x0, y0) * (1.0 - fx) + at(x0 + 1, y0) * fx;
+                let bottom = at(x0, y0 + 1) * (1.0 - fx) + at(x0 + 1, y0 + 1) * fx;
+                top * (1.0 - fy) + bottom * fy
+            };
+            pixels.push(value.round() as u8);
+        }
+    }
+    Raster::from_pixels(w, h, pixels).unwrap()
+}
+
+#[test]
+fn pages_bent_by_a_tenth_of_a_block_are_read() {
+    let data = sample(9_000);
+    let (_, page) = one_page(&data);
+    // A block is about 105 pixels wide at this resolution; the bend moves dots by up to 8 of them.
+    let curved = bent(&page, 8.0);
+    assert_eq!(restore(curved).unwrap(), data);
+}
+
+#[test]
+fn pages_photographed_at_an_angle_are_read() {
+    let data = sample(9_000);
+    let (_, page) = one_page(&data);
+    let slanted = foreshortened(&page, 0.10);
+    assert_eq!(restore(slanted).unwrap(), data);
+}
+
+#[test]
+fn pictures_of_one_sheet_complete_each_other_and_reading_stops_when_the_file_is_complete() {
+    let data = sample(9_000);
+    let (_, page) = one_page(&data);
+    let (width, height) = (page.width(), page.height());
+    let third = width / 3;
+    // The first picture lacks the right third of the sheet, the second the left third (and with
+    // it the labels there) and is turned a quarter, so its cells are numbered another way.
+    let mut first = page.clone();
+    first.fill_rect(width - third, 0, third, height, WHITE);
+    let mut second = page.clone();
+    second.fill_rect(0, 0, third, height, WHITE);
+    let second = rotated_quarter_turn(&second);
+
+    let mut alone = None;
+    let _ = decode(
+        std::slice::from_ref(&second),
+        &DecodeOptions::default(),
+        |outcome| alone = outcome.result.ok().map(|stats| stats.good_blocks),
+    );
+
+    let mut outcomes = Vec::new();
+    let restored = decode(
+        &[first, second, page.clone()],
+        &DecodeOptions::default(),
+        |outcome| outcomes.push(outcome),
+    )
+    .unwrap();
+    assert_eq!(restored.data, data);
+
+    // The second picture was read only where the first had no block: fewer than alone.
+    let in_second = outcomes[1].result.as_ref().unwrap().good_blocks;
+    assert!(
+        in_second < alone.unwrap(),
+        "{in_second} blocks read after the first picture, {alone:?} alone"
+    );
+    // The third picture would restore the file by itself and was not read: the file was complete.
+    assert!(outcomes[2].result.is_err());
+}

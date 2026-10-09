@@ -67,6 +67,22 @@ pub struct Page {
     pub dpi: u32,
 }
 
+/// Gray values from this level up are paper in [`Page::black_and_white`]. The page text and the
+/// dots are drawn at 0, 64 and 128, all of which print as ink.
+const PAPER_FROM: u8 = 192;
+
+impl Page {
+    /// The page with ink black and paper white and nothing in between, for output that
+    /// is printed: a black dot prints crisper than a gray one, which a printer would halftone.
+    #[must_use]
+    pub fn black_and_white(&self) -> Page {
+        Page {
+            raster: self.raster.black_and_white(PAPER_FROM),
+            dpi: self.dpi,
+        }
+    }
+}
+
 /// Renders `data` as pages ready to print.
 pub fn encode(data: &[u8], options: &EncodeOptions) -> Result<Vec<Page>> {
     let salt_and_iv = match options.password.as_deref() {

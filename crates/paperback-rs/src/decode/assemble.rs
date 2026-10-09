@@ -5,6 +5,8 @@
 //! Gathers the blocks of all scanned pages of one backup, repairs missing
 //! blocks from the recovery blocks and restores the original file.
 
+use super::hints::ScanHints;
+use super::sheet::LatticeRead;
 use crate::block::{DATA_LEN, FileTime, SuperBlock};
 use crate::codec::{self, SALT_AND_IV_LEN};
 use crate::crc::crc16;
@@ -19,6 +21,12 @@ pub(crate) struct ScannedPage {
     pub(crate) group_size: usize,
     pub(crate) blocks: Vec<ScannedBlock>,
     pub(crate) statistics: PageStatistics,
+    /// Where in the picture given by the caller blocks were read, one point each.
+    pub(crate) read_places: Vec<(f64, f64)>,
+    /// Distance between neighbouring blocks in the picture given by the caller.
+    pub(crate) block_size: f64,
+    /// The grid of the first reading of the picture and the block read in each cell.
+    pub(crate) lattice: LatticeRead,
     /// How well each block read, when asked for.
     pub(crate) quality: Option<PageQuality>,
 }
@@ -36,6 +44,13 @@ impl ScannedPage {
                 .filter(|b| !known.contains(&b.identity())),
         );
         self.statistics.good_blocks += self.blocks.len() - before;
+        self.read_places.extend(other.read_places);
+        if self.lattice.columns == 0 {
+            self.lattice = other.lattice;
+        }
+        if self.block_size <= 0.0 {
+            self.block_size = other.block_size;
+        }
         self.statistics.bad_blocks = self.statistics.bad_blocks.min(other.statistics.bad_blocks);
         self.statistics.restored_bytes = self
             .statistics
@@ -89,6 +104,8 @@ pub struct PageStatistics {
     pub superblocks: usize,
     /// Bytes repaired by error correction.
     pub restored_bytes: usize,
+    /// What looks wrong with the scan; only filled in for pages that read badly.
+    pub hints: ScanHints,
 }
 
 /// Summary of a restoration, for diagnostics.
@@ -104,6 +121,8 @@ pub struct Report {
     pub restored_bytes: usize,
     /// Blocks rebuilt from recovery blocks.
     pub recovered_blocks: usize,
+    /// What looks wrong with the scans that read badly, over all pages.
+    pub hints: ScanHints,
 }
 
 #[derive(Clone, Debug)]
@@ -383,7 +402,13 @@ impl Assembler {
         backup.report.good_blocks += page.statistics.good_blocks + page.statistics.superblocks;
         backup.report.bad_blocks += page.statistics.bad_blocks;
         backup.report.restored_bytes += page.statistics.restored_bytes;
+        backup.report.hints.merge(&page.statistics.hints);
         backup.repair_groups();
+    }
+
+    /// Whether the pages given so far hold the whole file, so that no more are needed.
+    pub(crate) fn is_complete(&self) -> bool {
+        matches!(self.backups.as_slice(), [backup] if backup.is_complete())
     }
 
     /// Restores the file if all of its blocks are present.
@@ -446,6 +471,9 @@ mod tests {
             group_size,
             blocks,
             statistics: PageStatistics::default(),
+            read_places: Vec::new(),
+            block_size: 0.0,
+            lattice: LatticeRead::default(),
             quality: None,
         }
     }

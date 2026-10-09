@@ -38,6 +38,17 @@ pub(crate) struct Grid {
     pub(crate) y_angle: f64,
 }
 
+impl Grid {
+    /// The same grid in a bitmap that contains the one it was found in at (`dx`, `dy`).
+    pub(crate) fn translated(&self, dx: f64, dy: f64) -> Self {
+        Self {
+            x_peak: self.x_peak + dx - dy * self.x_angle,
+            y_peak: self.y_peak + dy - dx * self.y_angle,
+            ..*self
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Extent {
     min: usize,
@@ -59,6 +70,31 @@ impl SearchWindow {
 
     fn height(&self) -> usize {
         self.y1 - self.y0
+    }
+}
+
+#[cfg(test)]
+mod translation_tests {
+    use super::*;
+
+    #[test]
+    fn a_translated_grid_has_its_lines_where_they_were_in_the_larger_bitmap() {
+        let grid = Grid {
+            x_peak: 10.0,
+            x_step: 50.0,
+            x_angle: 0.02,
+            y_peak: 5.0,
+            y_step: 60.0,
+            y_angle: -0.01,
+        };
+        let moved = grid.translated(100.0, 40.0);
+        // The line through (30, 20) of the small bitmap runs through (130, 60) of the large one.
+        let small_line = grid.x_peak + 0.0 * grid.x_step + 20.0 * grid.x_angle;
+        let large_line = moved.x_peak + 60.0 * moved.x_angle;
+        assert!((large_line - (small_line + 100.0)).abs() < 1e-9);
+        let small_row = grid.y_peak + 30.0 * grid.y_angle;
+        let large_row = moved.y_peak + 130.0 * moved.y_angle;
+        assert!((large_row - (small_row + 40.0)).abs() < 1e-9);
     }
 }
 

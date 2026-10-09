@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.1.0
+
+- Blocks that do not read are repaired a second time with the least certain bytes treated as erasures, which reads
+  more of badly printed or photographed pages.
+- With `-v` (and in the `--json` summary) pages that read badly come with hints: too few pixels per dot, a black and
+  white scan, stretched contrast, sharpening halos.
+- PDF pages are stored as 1-bit black and white images, half the size and printed as solid dots.
+- Reading goes in passes of rising effort that visit only the blocks still missing; a turned picture is read only where
+  no block was read before. The checksum picks the best sampling per quadrant for blocks nothing else reads.
+- Several photos or scans of one sheet are combined; a later picture is read only where earlier ones left blocks missing,
+  and reading stops once the file is complete.
+- Bent, creased and photographed pages: every block is read through its own corners, found by following the printed
+  grid lines, with perspective and curved edges taken into account. The quality pictures follow the real blocks.
+
 ## 1.0.0
 
 - First version: `encode` and `decode` commands.

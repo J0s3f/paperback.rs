@@ -11,9 +11,9 @@ keywords.workspace = true
 readme.workspace = true
 categories = ["encoding", "multimedia::images"]
 rust-version.workspace = true
-# crates.io allows 10 MB per crate; the scans (about 17 MB) stay in the repository, and the tests skip
-# cases without scans.
-exclude = ["tests/fixtures/realworld/scans/*"]
+# crates.io allows 10 MB per crate; the scans (about 17 MB) and the synthetic pages (about 6 MB) stay in
+# the repository, and the tests skip the cases without their pictures.
+exclude = ["tests/fixtures/realworld/scans/*", "tests/fixtures/synthetic/*.png"]
 
 [lints]
 workspace = true

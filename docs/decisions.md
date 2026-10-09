@@ -177,3 +177,79 @@ only incomplete pages are rotated and read again, which keeps good scans fast.
 Photographs of crumpled paper turn neighbouring blocks by different amounts, so a block that does not read is also tried with
 the local rotation of its neighbours and a few small steps around it. That roughly doubles the blocks read on a phone photo of a
 crumpled sheet.
+
+## Erasures, scan hints and black and white PDFs
+
+- **Erasures.** For a block that does not read as it is, the reader marks the 16 (then 24) bytes whose dots were closest to
+  the black/white limit as erasures and repairs the block with the Reed-Solomon decoder, which was extended with the
+  erasure locator of Phil Karn's original routine. An erased byte costs one parity byte instead of two. At most 24 are
+  used and the 16-bit checksum must still match, because with fewer parity bytes left over to check the result a wrong
+  block would pass more easily. Pages on paper are unchanged, so compatibility is not affected. On the test scans it read
+  4% to 8% more blocks of the borderline inkjet scans and about half as many again of one phone photo, and every restored
+  file stayed identical.
+- **Hints.** `decode/hints.rs` looks at pages that read badly (any unreadable block or more than four corrected bytes per
+  block) and names likely causes. They are advice for people, never used by the reader, and computed only when `-v` or
+  `--json` asks for them (`DecodeOptions::diagnose`). Idea from the scan diagnostics of the paperback-cli project; the
+  checks are our own.
+- **PDF output.** The encoder draws dots at gray 64, lines at 0 and text at 128, like the original's bitmaps. For PDF
+  output only, pages are converted to pure black and white and stored with one bit per pixel. PNG and BMP pages are
+  untouched.
+
+## Following bent paper block by block (corner mesh)
+
+A straight, tilted grid fits a flat scan. A crumpled page, or a photograph taken at an angle, needs more, so a block that
+does not read as the grid says is read through its own corners (`decode/mesh.rs`):
+
+- **Mesh.** Every corner where four blocks meet is found as the crossing of a dark horizontal and a dark vertical line,
+  starting in the middle of the page and moving outwards. Each next corner is searched where the last steps (including
+  the trend of their length, as in a perspective) predict it, and counts as found when its lines are clearly darker than
+  the paper beside them, relative to the corner it was predicted from because lines fade towards the edge of a photo. The
+  middle of every line between two corners is measured too.
+- **Block.** A block is its four corners plus the middle of its four edges. Inside, the dots lie on a perspective
+  projection of the corners, bent along the measured edges (a Coons patch), so a block that is foreshortened or curved is
+  sampled where its dots really are. Like the original, nine slightly shifted samplings are tried and the sharpest
+  sub-blocks combined.
+- **Where the grid is found.** If fitting the grid on the whole picture does not lead to readable blocks (strong
+  perspective bends the lines too much), it is fitted on the middle part of the picture instead and the mesh follows the rest.
+- **Quality pictures** are drawn through the same corners, so the colours lie on the blocks of a bent page. Blocks whose
+  lines were not found are not drawn as damaged: they are outside the page.
+- **Measured** on test pages bent by a sine of 8 to 20 pixels (a block is 105 pixels): 8 pixels went from 54 to all 101
+  blocks, 20 pixels from 10 to 57; foreshortening by 10% from 29 to all, by 15% from nothing to 95 and by 25% from nothing to
+  73. On phone photos of a crumpled sheet 118 of 334 blocks became 292 and 151 became 280. Not enough for a full restore of
+  those photos, but the pictures are a lot more useful for deciding what to scan again.
+
+The mesh is built only when a block cannot be read otherwise, so pages that read cleanly pay nothing for it.
+
+## Improving the reading of bad pages, step by step
+
+Ideas from the literature on distorted lattices, 2D barcodes and page-oriented optical storage were tried one at a time on a
+fixed set of 13 difficult pages (the pages in `tests/fixtures/synthetic` and `tests/fixtures/realworld/scans`, and two phone
+photographs of a crumpled sheet). Blocks restored, of the 334 that two of the photos hold and of the 101 of the synthetic pages:
+
+| Step | Photo A | Photo B | bent 16 | bent 20 | slant 15 | slant 25 | Verdict |
+|---|---|---|---|---|---|---|---|
+| start | 280 | 292 | 99 | 71 | 95 | 73 | |
+| 1 detector learned from the page | 291 | 292 | 99 | 71 | 95 | 73 | kept; small. Raw dot errors on decoded blocks are about the same with a threshold (2.2%) and with the learned detector, so the errors are position and noise, not blur between neighbours |
+| 3a cross-ratio prediction, several meshes | 301 | 305 | all | 72 | all | 97 | kept; the union of meshes made it never worse than one mesh |
+| 3b surface fitted through corners | 300 | 310 | all | 79 | all | 92 | kept; better on average |
+| passes of rising effort, blocks read once | 302 | 309 | all | 79 | all | 94 | kept; same results, 40% faster than before it |
+| 2 checksum chooses the sampling per quadrant | 304 | 315 | all | 92 | all | all | kept; the largest gain on bent pages |
+| 3c corners from fitted lines | 304 | 313 | all | 88 | all | 93 | dropped: dots sampled more exactly (fewer corrections) but fewer pages complete |
+| 4 ladder of erasure counts | 304 | 315 | all | 92 | all | all | dropped: same results, slower |
+
+Blocks are read in passes of rising effort (quick, normal, deep), each pass only visiting blocks that are still missing; a
+picture that is read again after being turned skips every cell where a block was read before (mapped back to the original
+picture), except cells read again as neighbours or as training for the detector because a step needs them. Everything
+that was read is kept.
+
+## Several pictures of one sheet
+
+All pictures of a sheet show the same grid of cells, each numbered from its own corner and possibly turned or mirrored
+(`decode/sheet.rs`). Blocks have no address before they are read, so a new picture is first looked at in a few cells
+spread over its middle (read with normal effort); the addresses found there vote for which of the eight turns and mirrors,
+and which shift, relate its grid to the earlier ones. If most agree, every cell whose block an earlier picture gave is
+skipped, and what the picture reads is added to the sheet's map for the next one. A picture that shows no label block but
+is found to show a known sheet takes that sheet's label. When the assembler holds the whole file, later pictures are not
+read. Skipped cells still count as known places for the later attempts on the same picture (the rotated copies), and
+neighbours that a retry needs are read like any other block. Not done: a map from cells to addresses without reading
+(which would need the layout of the sheet, or a layout record on the page).

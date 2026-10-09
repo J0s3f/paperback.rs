@@ -31,7 +31,7 @@ Credits and licences of the parts it builds on are in [NOTICE.md](NOTICE.md).
 - Read pages from PNG, JPEG, BMP and PDF files, in any order, whether they come from this tool, the original,
   a scanner or a camera. PDFs may hold Flate, LZW, JPEG, JPEG 2000, CCITT fax or JBIG2 images.
 - Rebuild the file when pages are tilted (up to 45 degrees; the original copes with about 5), rotated by a
-  quarter turn, upside down, mirrored, crumpled and flattened again, or lightly damaged: every block has its own error correction, and a
+  quarter turn, upside down, mirrored, crumpled and flattened again, photographed at an angle, or lightly damaged: every block has its own error correction, and a
   recovery block per group of data blocks rebuilds one lost block.
 - Compress with bzip2 before printing.
 - Work in pipelines: standard input and output, quiet on success, clear exit codes.
@@ -81,6 +81,29 @@ kilobytes with the default settings (before compression).
 
 Exit status: 0 success, 1 failure, 2 usage error, 3 unreadable or incomplete input (the message names the pages
 to scan again), 4 missing or wrong password.
+
+## Combining several photos or scans of the same page
+
+A page that is creased, folded, shadowed or photographed from a bad angle often reads in parts. You do not need one
+perfect picture: give the decoder several pictures of the same sheet and it combines what each one shows.
+
+```
+paperback-rs decode photo1.jpg photo2.jpg photo3.jpg -o report.tar -v
+```
+
+- **How it works.** Every block that is read carries its address in the file, so blocks from different pictures slot
+  together and duplicates are dropped. Which blocks are still missing after one picture does not matter; the next
+  picture only has to show them.
+- **Which pictures belong together.** The decoder recognises the sheet from the label printed on it and from the blocks
+  read, so you can pass the pictures in any order, turned or mirrored, at different sizes, and mix photos with scans.
+  Pictures of different pages of one file work the same way. Pictures of different files are refused with a message.
+- **What helps most.** Pictures that fail in different places: another angle, other light, the creased part laid
+  flat, a second scanner. Two pictures with the same shadow have the same gaps. A close-up of a corner is of use only if
+  the grid of blocks is clearly visible in it.
+- **It saves time.** A picture is read only where the pictures before it left blocks missing, and when the file is
+  complete the remaining pictures are not read at all (`-v` says "not read: the file is complete already").
+- **Checking.** `-v` prints what each picture gave, and `--quality-overlay q-%d.png` writes one picture per input that
+  shows which blocks it read, so you can see what the next photo has to cover.
 
 ## Checking the quality of a scan
 

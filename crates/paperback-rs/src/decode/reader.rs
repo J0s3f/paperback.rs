@@ -6,9 +6,11 @@
 //! and error correction.
 
 use super::bitmap::Bitmap;
+use super::detector::DotDetector;
 use super::grid::{Grid, Intensity};
+use super::mesh::{Mesh, Quad, sample};
 use super::peaks::find_peaks;
-use crate::block::{BLOCK_DOTS, RawBlock, row_mask};
+use crate::block::{BLOCK_DOTS, BLOCK_LEN, RawBlock, row_mask};
 use crate::crc::crc16;
 
 const SUBBLOCK_SIZE: usize = 8;
@@ -24,6 +26,22 @@ const LOCAL_SHARPNESS_BOOSTS: [(f64, f64); 5] =
 const TILT_STEPS: [f64; 6] = [0.02, -0.02, 0.04, -0.04, 0.07, -0.07];
 /// Guesses at most per block: their average, single neighbours, then the rotations.
 const MAX_POSE_TRIES: usize = 12;
+/// Guesses tried at normal effort: the average of the neighbours and a couple of single ones.
+const NORMAL_POSE_TRIES: usize = 3;
+/// Corners of a block that must be found in the picture before it is read through them.
+const MIN_CORNERS: usize = 3;
+/// Reach of the averaging around a dot, as a share of the distance between two dots; a
+/// small window keeps the dot sharp, a wider one forgives errors in its place.
+const WARPED_DOT_WINDOWS: [f64; 2] = [0.3, 0.55];
+/// Shift of the nine samplings, as a share of the distance between two dots.
+const WARPED_SHIFT: f64 = 0.35;
+/// Scores of the learned detector are about 1 for a sure dot; certainties are whole numbers.
+const CERTAINTY_SCALE: f64 = 1000.0;
+/// Settings of how much a mesh trusts the perspective prediction of the next corner.
+const MESH_TRUSTS: [f64; 3] = [0.5, 1.0, 0.0];
+/// Sampling shifts kept for each quadrant when the checksum decides where the dots are; with
+/// four quadrants that is 256 combinations.
+const ALIGNED_CANDIDATES: usize = 4;
 const MAX_SHARPNESS: f64 = 6.0;
 const UNREADABLE: usize = 17;
 const MAX_CORRECTIONS: usize = 16;
@@ -32,6 +50,8 @@ const CRC_COVERED: usize = 94;
 const ECC_PAD: usize = 127;
 const NEIGHBOUR_WEIGHTS: [i32; 3] = [1000, 32, 16];
 const THRESHOLD_VARIANTS: usize = 9;
+/// Threshold variants of the quick pass: the three neighbour weights, one threshold each.
+const QUICK_VARIANTS: usize = 3;
 const ORIENTATIONS: usize = 8;
 
 type DotGrid = [[u8; BLOCK_DOTS]; BLOCK_DOTS];
@@ -46,6 +66,31 @@ pub(crate) enum BlockOutcome {
         block: RawBlock,
         corrected: usize,
     },
+    /// Not read: a block was read at this place in an earlier reading of the page.
+    Skipped,
+}
+
+/// How much work is spent on a block. Reading goes in passes over the blocks that are still
+/// missing, from the quick one that reads most of a good page to the deep one that tries
+/// everything, so the expensive attempts are made only on the few blocks that need them and a
+/// block that was read is never read again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Effort {
+    /// The grid as fitted, one sharpness, a few thresholds.
+    Quick,
+    /// All sharpness and threshold variants, the block's own corners, a few guesses from
+    /// the neighbours.
+    Normal,
+    /// Everything: erasures, the learned detector, every mesh and every guess.
+    Deep,
+}
+
+/// The corner mesh of a page, which is only built if a block cannot be read otherwise.
+enum MeshState {
+    NotBuilt,
+    /// There are no grid lines to follow.
+    Missing,
+    Built(Mesh),
 }
 
 pub(crate) struct BlockReader<'a> {
@@ -71,6 +116,13 @@ pub(crate) struct BlockReader<'a> {
     /// the grid angles. Photographs of bent paper turn blocks by different amounts.
     tilts: Vec<Option<f64>>,
     page_angles: (f64, f64),
+    /// The corners of all blocks, found when the first block needed them; `Some(None)` if there
+    /// are no grid lines to follow.
+    /// One mesh per prediction setting of [`MESH_TRUSTS`], each built when first needed.
+    meshes: Vec<MeshState>,
+    effort: Effort,
+    /// Learns from the blocks that were read how dots look on this page.
+    detector: DotDetector,
     rotated: Vec<u8>,
     sharpened: Vec<u8>,
 }
@@ -125,6 +177,9 @@ impl<'a> BlockReader<'a> {
             shifts: vec![None; columns * rows],
             tilts: vec![None; columns * rows],
             page_angles: (grid.x_angle, grid.y_angle),
+            meshes: MESH_TRUSTS.iter().map(|_| MeshState::NotBuilt).collect(),
+            effort: Effort::Quick,
+            detector: DotDetector::new(),
             rotated: vec![0; buffer_width * buffer_height],
             sharpened: vec![0; buffer_width * buffer_height],
         }
@@ -133,6 +188,35 @@ impl<'a> BlockReader<'a> {
     /// The grid with the page-relative origin used for reading blocks.
     pub(crate) fn grid(&self) -> Grid {
         self.grid
+    }
+
+    /// The middle of the cell in the bitmap, as the straight grid has it.
+    pub(crate) fn cell_centre(&self, column: usize, row: usize) -> (f64, f64) {
+        let g = &self.grid;
+        let from_bottom = self.rows - 1 - row;
+        let start = (
+            g.x_peak + (column as f64 + 0.5) * g.x_step,
+            g.y_peak + (from_bottom as f64 + 0.5) * g.y_step,
+        );
+        let (x_angle, y_angle) = self.page_angles;
+        let mut point = start;
+        for _ in 0..3 {
+            point.0 = start.0 + point.1 * x_angle;
+            point.1 = start.1 + point.0 * y_angle;
+        }
+        point
+    }
+
+    /// Where a block that was read lies in the bitmap: the middle of its cell, moved by the
+    /// shift that was measured when it was read.
+    pub(crate) fn read_position(&self, column: usize, row: usize) -> Option<(f64, f64)> {
+        let shift = self.shifts[row * self.columns + column]?;
+        let centre = self.cell_centre(column, row);
+        Some((centre.0 + shift.0, centre.1 + shift.1))
+    }
+
+    pub(crate) fn set_effort(&mut self, effort: Effort) {
+        self.effort = effort;
     }
 
     pub(crate) fn columns(&self) -> usize {
@@ -146,7 +230,27 @@ impl<'a> BlockReader<'a> {
     /// Reads a block where the grid says it is, then where its neighbours' real
     /// positions suggest it is, which follows paper that is bent or crumpled.
     pub(crate) fn read(&mut self, column: usize, row: usize) -> BlockOutcome {
-        let mut outcome = self.read_posed(column, row, (0.0, 0.0), 0.0, true);
+        let every_level = self.effort >= Effort::Normal;
+        let outcome = self.read_posed(column, row, (0.0, 0.0), 0.0, every_level);
+        if matches!(outcome, BlockOutcome::Readable { .. }) || self.effort == Effort::Quick {
+            return outcome;
+        }
+        // Through its own corners first: it is the cheaper of the two ways to follow bent paper,
+        // and the one that works when the straight grid is far off.
+        if let Some((block, corrected)) = self.read_warped(column, row) {
+            return BlockOutcome::Readable { block, corrected };
+        }
+        self.read_like_neighbours(column, row, outcome)
+    }
+
+    /// Tries the shift and the rotation of the blocks around this one, and a few rotations
+    /// near theirs; `outcome` is what reading it where the grid says gave.
+    fn read_like_neighbours(
+        &mut self,
+        column: usize,
+        row: usize,
+        mut outcome: BlockOutcome,
+    ) -> BlockOutcome {
         let neighbours = self.neighbour_shifts(column, row);
         let Some(average) = Self::mean(&neighbours) else {
             return outcome;
@@ -157,7 +261,11 @@ impl<'a> BlockReader<'a> {
         let guesses = std::iter::once((average, tilt))
             .chain(single_shifts)
             .chain(tilted)
-            .take(MAX_POSE_TRIES);
+            .take(if self.effort == Effort::Deep {
+                MAX_POSE_TRIES
+            } else {
+                NORMAL_POSE_TRIES
+            });
         for (attempt, (shift, tilt)) in guesses.enumerate() {
             if matches!(outcome, BlockOutcome::Readable { .. }) {
                 break;
@@ -173,6 +281,201 @@ impl<'a> BlockReader<'a> {
         outcome
     }
 
+    /// The corners of all blocks, found when first needed. `None` if there are no grid lines
+    /// to follow.
+    fn mesh(&mut self, variant: usize) -> Option<&Mesh> {
+        if matches!(self.meshes[variant], MeshState::NotBuilt) {
+            self.meshes[variant] = Mesh::build(
+                self.bitmap,
+                self.grid,
+                self.columns,
+                self.rows,
+                self.page_angles,
+                MESH_TRUSTS[variant],
+            )
+            .map_or(MeshState::Missing, MeshState::Built);
+        }
+        match &self.meshes[variant] {
+            MeshState::Built(mesh) => Some(mesh),
+            MeshState::NotBuilt | MeshState::Missing => None,
+        }
+    }
+
+    /// The four corners of every block, row by row from the top, for drawing the page; follows
+    /// the grid lines across the page if that has not been done yet.
+    pub(crate) fn cell_quads(&mut self) -> Option<Vec<Quad>> {
+        let (columns, rows) = (self.columns, self.rows);
+        let mesh = self.mesh(0)?;
+        Some(
+            (0..rows)
+                .flat_map(|row| (0..columns).map(move |column| (column, row)))
+                .map(|(column, row)| mesh.quad(column, rows - 1 - row))
+                .collect(),
+        )
+    }
+
+    /// Reads a block through its own four corners, which follow bent or creased paper.
+    /// Only blocks with at least three corners found in the picture are tried, so the empty
+    /// margin of the page costs nothing.
+    fn read_warped(&mut self, column: usize, row: usize) -> Option<(RawBlock, usize)> {
+        // A block that one mesh cannot read is tried with the next: whatever any of them reads is kept.
+        let meshes = if self.effort == Effort::Deep {
+            MESH_TRUSTS.len()
+        } else {
+            1
+        };
+        (0..meshes).find_map(|variant| self.read_warped_with(variant, column, row))
+    }
+
+    fn read_warped_with(
+        &mut self,
+        variant: usize,
+        column: usize,
+        row: usize,
+    ) -> Option<(RawBlock, usize)> {
+        let from_bottom = self.rows - 1 - row;
+        let mesh = self.mesh(variant)?;
+        let quad = mesh.quad(column, from_bottom);
+        if quad.corners_found < MIN_CORNERS {
+            return None;
+        }
+        let ideal_middle = {
+            let (low, high) = (
+                mesh.ideal(column, from_bottom),
+                mesh.ideal(column + 1, from_bottom + 1),
+            );
+            (f64::midpoint(low.0, high.0), f64::midpoint(low.1, high.1))
+        };
+        for window in WARPED_DOT_WINDOWS {
+            // Like the original, read the block as sampled and, failing that, from the sharpest
+            // sub-blocks of nine slightly shifted samplings; that absorbs what the corners and
+            // edge middles do not capture of the bending inside the block.
+            let shifted: Vec<DotGrid> = (0..SHIFT_COUNT)
+                .map(|shift| {
+                    let (dy, dx) = ((shift / 3) as f64 - 1.0, (shift % 3) as f64 - 1.0);
+                    self.sample_quad(&quad, window, (dx * WARPED_SHIFT, dy * WARPED_SHIFT))
+                })
+                .collect();
+            let mut found = self
+                .recognise(&shifted[CENTER_SHIFT])
+                .or_else(|| self.recognise(&best_focused_grid(&shifted)));
+            if found.is_none() && self.effort == Effort::Deep {
+                found = self.read_aligned(&shifted);
+            }
+            if let Some(found) = found {
+                let middle = quad.at(0.5, 0.5);
+                self.shifts[row * self.columns + column] =
+                    Some((middle.0 - ideal_middle.0, middle.1 - ideal_middle.1));
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Reads a block whose dots are not where the corners and edges put them, by letting the
+    /// error correction decide where they are: every quadrant of the block takes one of its
+    /// sharpest samplings out of the nine, and the combinations are tried until the checksum
+    /// agrees. Needs the orientation of the page, which is known once any block was read.
+    fn read_aligned(&mut self, shifted: &[DotGrid]) -> Option<(RawBlock, usize)> {
+        let orientation = self.orientation?;
+        let ranked: Vec<Vec<usize>> =
+            (0..QUADRANTS)
+                .map(|quadrant| {
+                    let (top, left) = quadrant_origin(quadrant);
+                    let mut order: Vec<usize> = (0..shifted.len()).collect();
+                    order.sort_by(|&a, &b| {
+                        sub_block_dispersion(&shifted[b], top, left)
+                            .total_cmp(&sub_block_dispersion(&shifted[a], top, left))
+                    });
+                    order.truncate(ALIGNED_CANDIDATES);
+                    order
+                })
+                .collect();
+        for combination in 0..ALIGNED_CANDIDATES.pow(QUADRANTS as u32) {
+            let mut grid = [[0u8; BLOCK_DOTS]; BLOCK_DOTS];
+            let mut rest = combination;
+            for (quadrant, order) in ranked.iter().enumerate() {
+                let chosen = &shifted[order[rest % ALIGNED_CANDIDATES]];
+                rest /= ALIGNED_CANDIDATES;
+                let (top, left) = quadrant_origin(quadrant);
+                for j in top..top + QUADRANT {
+                    grid[j][left..left + QUADRANT]
+                        .copy_from_slice(&chosen[j][left..left + QUADRANT]);
+                }
+            }
+            if let Some((block, corrected)) = self.read_with_one_threshold(&grid, orientation) {
+                self.learn_from(&grid, &block);
+                return Some((block, corrected));
+            }
+        }
+        None
+    }
+
+    /// One plain attempt at turning the gray levels into a block: the variant that read last, a
+    /// threshold at the mean. Cheap, for trying many samplings.
+    fn read_with_one_threshold(
+        &self,
+        grid: &DotGrid,
+        orientation: usize,
+    ) -> Option<(RawBlock, usize)> {
+        let (weight, threshold_shift) = self.variant_parameters(self.last_good_variant);
+        let adjusted = overlap_corrected(grid, weight, self.intensity.max);
+        let limit = adjusted.iter().flatten().sum::<i32>() / 1024 + threshold_shift * weight;
+        let mut rows = [0u32; BLOCK_DOTS];
+        for (j, row) in rows.iter_mut().enumerate() {
+            for i in 0..BLOCK_DOTS {
+                let (a, b) = orient(orientation, j, i);
+                if adjusted[a][b] < limit {
+                    *row |= 1 << i;
+                }
+            }
+            *row ^= row_mask(j);
+        }
+        let mut block = RawBlock::from_rows(&rows);
+        let corrected = block.correct().filter(|&n| n <= MAX_CORRECTIONS)?;
+        block_crc_matches(&block).then_some((block, corrected))
+    }
+
+    /// The 32x32 dots of a block as gray levels, each the average of a few samples around
+    /// the dot's place inside the quadrilateral.
+    fn sample_quad(&self, quad: &Quad, window: f64, shift: (f64, f64)) -> DotGrid {
+        let cell = BLOCK_DOTS as f64 + 3.0;
+        let pitch = {
+            let length = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).hypot(a.1 - b.1);
+            (length(quad.lower_left, quad.lower_right)
+                + length(quad.upper_left, quad.upper_right)
+                + length(quad.lower_left, quad.upper_left)
+                + length(quad.lower_right, quad.upper_right))
+                / 4.0
+                / cell
+        };
+        let reach = window * pitch;
+        let white = f64::from(self.intensity.max as u8);
+        let mut grid = [[0u8; BLOCK_DOTS]; BLOCK_DOTS];
+        for (j, row) in grid.iter_mut().enumerate() {
+            for (i, dot) in row.iter_mut().enumerate() {
+                let on_page = quad.at((2.0 + i as f64) / cell, (2.0 + j as f64) / cell);
+                let middle = (on_page.0 + shift.0 * pitch, on_page.1 + shift.1 * pitch);
+                let around = [
+                    (0.0, 0.0),
+                    (0.0, 0.0),
+                    (reach, 0.0),
+                    (-reach, 0.0),
+                    (0.0, reach),
+                    (0.0, -reach),
+                ];
+                let sum: f64 = around
+                    .iter()
+                    .map(|&(dx, dy)| {
+                        sample(self.bitmap, (middle.0 + dx, middle.1 + dy)).unwrap_or(white)
+                    })
+                    .sum();
+                *dot = (sum / around.len() as f64).round() as u8;
+            }
+        }
+        grid
+    }
+
     /// The average local rotation of the readable blocks around this one.
     fn neighbour_tilt(&self, column: usize, row: usize) -> f64 {
         let known: Vec<f64> = (row.saturating_sub(1)..=(row + 1).min(self.rows - 1))
@@ -186,6 +489,20 @@ impl<'a> BlockReader<'a> {
         } else {
             known.iter().sum::<f64>() / known.len() as f64
         }
+    }
+
+    /// Whether the corner mesh has found the lines around a cell, which is then a block of the
+    /// page, not empty margin.
+    pub(crate) fn mesh_covers(&mut self, column: usize, row: usize) -> bool {
+        let from_bottom = self.rows - 1 - row;
+        self.mesh(0)
+            .is_some_and(|mesh| mesh.quad(column, from_bottom).corners_found >= MIN_CORNERS)
+    }
+
+    /// Whether the detector that learns how dots look on this page has seen too few blocks
+    /// to be of use yet.
+    pub(crate) fn detector_needs_blocks(&self) -> bool {
+        !self.detector.is_ready()
     }
 
     /// Whether a block that is not read yet has a readable neighbour to learn from.
@@ -261,7 +578,8 @@ impl<'a> BlockReader<'a> {
             let readable = self
                 .probe_positions(columns, rows)
                 .filter(|&(column, row)| {
-                    matches!(self.read_at(column, row), BlockOutcome::Readable { .. })
+                    // The whole chain, so a page that only the corner mesh can read is found too.
+                    matches!(self.read(column, row), BlockOutcome::Readable { .. })
                 })
                 .count();
             if readable > best.1 {
@@ -292,6 +610,13 @@ impl<'a> BlockReader<'a> {
     /// Whether any of a few blocks spread over the page can be read; a wrong
     /// grid fit reads nothing, and finding that out is cheap.
     pub(crate) fn finds_blocks(&mut self, columns: usize, rows: usize) -> bool {
+        let before = std::mem::replace(&mut self.effort, Effort::Normal);
+        let found = self.probe_blocks(columns, rows);
+        self.effort = before;
+        found
+    }
+
+    fn probe_blocks(&mut self, columns: usize, rows: usize) -> bool {
         (1..=rows).any(|r| {
             (1..=columns).any(|c| {
                 let column = self.columns * c / (columns + 1);
@@ -498,6 +823,9 @@ impl<'a> BlockReader<'a> {
             if let Some(found) = self.recognise(&shifted[CENTER_SHIFT]) {
                 return Some(found);
             }
+            if self.effort == Effort::Quick {
+                continue;
+            }
             if let Some(found) = self.recognise(&best_focused_grid(&shifted)) {
                 return Some(found);
             }
@@ -569,17 +897,90 @@ impl<'a> BlockReader<'a> {
         value as u8
     }
 
+    /// Turns sampled gray levels into a block: by thresholds first, and when that fails with
+    /// what was learned from the blocks read so far. Every block read teaches the detector.
+    fn recognise(&mut self, grid: &DotGrid) -> Option<(RawBlock, usize)> {
+        let mut found = self.recognise_by_threshold(grid);
+        if found.is_none() && self.effort == Effort::Deep {
+            found = self.recognise_learned(grid);
+        }
+        if let Some((block, _)) = &found {
+            self.learn_from(grid, block);
+        }
+        found
+    }
+
+    /// Gives the detector a block that was read, with the gray levels it was read from. The
+    /// orientations of [`orient`] count in the transposed picture, because the neighbour
+    /// correction of the original reads the centre dot transposed (see `overlap_corrected`);
+    /// the detector works on the samples as they are, hence `b` before `a` below.
+    fn learn_from(&mut self, grid: &DotGrid, block: &RawBlock) {
+        let Some(orientation) = self.orientation else {
+            return;
+        };
+        let rows = block.rows();
+        let mut dark_dots = [[false; BLOCK_DOTS]; BLOCK_DOTS];
+        for (j, row) in rows.iter().enumerate() {
+            let dark = row ^ row_mask(j);
+            for i in 0..BLOCK_DOTS {
+                let (a, b) = orient(orientation, j, i);
+                dark_dots[b][a] = dark >> i & 1 == 1;
+            }
+        }
+        self.detector.learn(grid, &dark_dots);
+    }
+
+    /// Reads the dots with the detector fitted to this page, and repairs the bits, with the
+    /// bytes it was least sure about as erasures if need be.
+    fn recognise_learned(&self, grid: &DotGrid) -> Option<(RawBlock, usize)> {
+        let orientation = self.orientation?;
+        if !self.detector.is_ready() {
+            return None;
+        }
+        let scores = self.detector.scores(grid);
+        let mut rows = [0u32; BLOCK_DOTS];
+        let mut certainty = [i32::MAX; BLOCK_LEN];
+        for (j, row) in rows.iter_mut().enumerate() {
+            for i in 0..BLOCK_DOTS {
+                let (a, b) = orient(orientation, j, i);
+                let score = scores[b][a];
+                if score > 0.0 {
+                    *row |= 1 << i;
+                }
+                let byte = j * 4 + i / 8;
+                certainty[byte] = certainty[byte].min((score.abs() * CERTAINTY_SCALE) as i32);
+            }
+            *row ^= row_mask(j);
+        }
+        let block = RawBlock::from_rows(&rows);
+        let mut direct = block.clone();
+        if let Some(corrected) = direct.correct().filter(|&n| n <= MAX_CORRECTIONS)
+            && block_crc_matches(&direct)
+        {
+            return Some((direct, corrected));
+        }
+        repair_doubtful_bytes(&block, &certainty)
+    }
+
     /// Turns sampled gray levels into bits and repairs them. Tries every
     /// orientation until one is known, and several neighbour-overlap and
     /// threshold variants, starting with the one that worked last.
-    fn recognise(&mut self, grid: &DotGrid) -> Option<(RawBlock, usize)> {
+    fn recognise_by_threshold(&mut self, grid: &DotGrid) -> Option<(RawBlock, usize)> {
         for orientation in 0..ORIENTATIONS {
             if self.orientation.is_some_and(|known| known != orientation) {
                 continue;
             }
-            for (attempt, local) in
-                (0..THRESHOLD_VARIANTS).flat_map(|attempt| [(attempt, false), (attempt, true)])
-            {
+            let mut doubtful: Option<(RawBlock, [i32; BLOCK_LEN])> = None;
+            let tries: Vec<(usize, bool)> = if self.effort == Effort::Quick {
+                (0..QUICK_VARIANTS)
+                    .map(|attempt| (attempt, false))
+                    .collect()
+            } else {
+                (0..THRESHOLD_VARIANTS)
+                    .flat_map(|attempt| [(attempt, false), (attempt, true)])
+                    .collect()
+            };
+            for (attempt, local) in tries {
                 let variant = (attempt + self.last_good_variant) % THRESHOLD_VARIANTS;
                 let (weight, threshold_shift) = self.variant_parameters(variant);
                 let adjusted = overlap_corrected(grid, weight, self.intensity.max);
@@ -591,16 +992,23 @@ impl<'a> BlockReader<'a> {
                     [[whole; 2]; 2]
                 };
                 let mut rows = [0u32; BLOCK_DOTS];
+                let mut certainty = [i32::MAX; BLOCK_LEN];
                 for (j, row) in rows.iter_mut().enumerate() {
                     for i in 0..BLOCK_DOTS {
                         let (a, b) = orient(orientation, j, i);
-                        if adjusted[a][b] < limits[a / QUADRANT][b / QUADRANT] {
+                        let limit = limits[a / QUADRANT][b / QUADRANT];
+                        if adjusted[a][b] < limit {
                             *row |= 1 << i;
                         }
+                        let byte = j * 4 + i / 8;
+                        certainty[byte] = certainty[byte].min((adjusted[a][b] - limit).abs());
                     }
                     *row ^= row_mask(j);
                 }
                 let mut block = RawBlock::from_rows(&rows);
+                if attempt == 0 && !local {
+                    doubtful = Some((block.clone(), certainty));
+                }
                 let Some(corrected) = block.correct().filter(|&n| n <= MAX_CORRECTIONS) else {
                     continue;
                 };
@@ -609,6 +1017,15 @@ impl<'a> BlockReader<'a> {
                     self.last_good_variant = variant;
                     return Some((block, corrected));
                 }
+            }
+            // Nothing read as it is: treat the bytes whose dots were hardest to tell apart
+            // as erased, which doubles what the error correction can repair.
+            if self.effort == Effort::Deep
+                && let Some(found) = doubtful
+                    .and_then(|(block, certainty)| repair_doubtful_bytes(&block, &certainty))
+            {
+                self.orientation = Some(orientation);
+                return Some(found);
             }
         }
         None
@@ -636,6 +1053,8 @@ struct BlockFit {
 /// Half a block; shadows of creases change the paper's brightness from one
 /// quadrant to the next, so each gets its own black/white limit.
 const QUADRANT: usize = BLOCK_DOTS / 2;
+/// Quadrants of a block.
+const QUADRANTS: usize = 4;
 
 fn quadrant_limits(adjusted: &[[i32; BLOCK_DOTS]; BLOCK_DOTS], shift: i32) -> [[i32; 2]; 2] {
     let mut limits = [[0; 2]; 2];
@@ -649,6 +1068,30 @@ fn quadrant_limits(adjusted: &[[i32; BLOCK_DOTS]; BLOCK_DOTS], shift: i32) -> [[
         }
     }
     limits
+}
+
+/// Erased bytes tried for a block that does not read as it is. Each erased byte costs one
+/// of the 32 parity bytes (an unknown error costs two), and wrongly erased good bytes waste
+/// that; with the checksum as the judge, a few sizes are tried. At most 24 are used: the
+/// fewer parity bytes are left over to check the result, the more likely a wrong block passes.
+const ERASURE_COUNTS: [usize; 2] = [16, 24];
+
+/// Tries the least certain bytes of `block` as erasures; the repaired block must pass its
+/// checksum. Returns it with the number of bytes that changed.
+fn repair_doubtful_bytes(
+    block: &RawBlock,
+    certainty: &[i32; BLOCK_LEN],
+) -> Option<(RawBlock, usize)> {
+    let mut by_certainty: Vec<usize> = (0..BLOCK_LEN).collect();
+    by_certainty.sort_by_key(|&byte| (certainty[byte], byte));
+    ERASURE_COUNTS.iter().find_map(|&count| {
+        let mut repaired = block.clone();
+        repaired.correct_erasing(&by_certainty[..count])?;
+        let changed = (0..BLOCK_LEN)
+            .filter(|&byte| repaired.0[byte] != block.0[byte])
+            .count();
+        block_crc_matches(&repaired).then_some((repaired, changed))
+    })
 }
 
 fn block_crc_matches(block: &RawBlock) -> bool {
@@ -735,6 +1178,24 @@ fn best_focused_grid(shifted: &[DotGrid]) -> DotGrid {
         }
     }
     combined
+}
+
+/// Top left dot of a quadrant, which are counted row by row.
+fn quadrant_origin(quadrant: usize) -> (usize, usize) {
+    ((quadrant / 2) * QUADRANT, (quadrant % 2) * QUADRANT)
+}
+
+/// How sharp a quadrant is: the contrast of its sub-blocks together.
+fn sub_block_dispersion(grid: &DotGrid, top: usize, left: usize) -> f64 {
+    [
+        (0, 0),
+        (0, SUBBLOCK_SIZE),
+        (SUBBLOCK_SIZE, 0),
+        (SUBBLOCK_SIZE, SUBBLOCK_SIZE),
+    ]
+    .iter()
+    .map(|&(down, right)| dispersion(grid, top + down, left + right))
+    .sum()
 }
 
 fn dispersion(grid: &DotGrid, top: usize, left: usize) -> f64 {
