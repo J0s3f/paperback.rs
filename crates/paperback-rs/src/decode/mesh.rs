@@ -642,6 +642,7 @@ fn edge_middle(bitmap: &Bitmap, from: Point, to: Point, step: f64, minimum: f64)
 
 /// Searches around `center` for the place where a horizontal and a vertical dark line cross.
 /// Returns the place to a fraction of a pixel and the contrast of the lines with the paper.
+#[cfg_attr(feature = "profile", inline(never))]
 fn refine(
     bitmap: &Bitmap,
     center: Point,
@@ -651,30 +652,56 @@ fn refine(
 ) -> Option<(Point, f64)> {
     let arm = (step * ARM_SHARE).max(4.0);
     let reach = radius.ceil() as isize;
-    let mut best: Option<(isize, isize, f64)> = None;
-    let mut scores = std::collections::HashMap::new();
+    let at = |dx: isize, dy: isize| (center.0 + dx as f64, center.1 + dy as f64);
+    // The best point is the first of the highest scores in the order of rows. The centre
+    // usually scores well, so starting with it lets most of the others be dismissed after
+    // the horizontal arm alone: the score is the smaller of the two arms.
+    let mut best: Option<(isize, isize, f64)> =
+        cross_contrast(bitmap, center, axes, arm).map(|score| (0, 0, score));
     for dy in -reach..=reach {
         for dx in -reach..=reach {
-            let point = (center.0 + dx as f64, center.1 + dy as f64);
-            let Some(score) = cross_contrast(bitmap, point, axes, arm) else {
+            if (dx, dy) == (0, 0) {
+                continue;
+            }
+            let point = at(dx, dy);
+            let Some(horizontal) = ridge(bitmap, point, axes.along_x, axes.along_y, arm) else {
                 continue;
             };
-            scores.insert((dx, dy), score);
-            if best.is_none_or(|(_, _, s)| score > s) {
+            if best.is_some_and(|(_, _, s)| horizontal < s) {
+                continue;
+            }
+            let Some(vertical) = ridge(bitmap, point, axes.along_y, axes.along_x, arm) else {
+                continue;
+            };
+            let score = horizontal.min(vertical);
+            let earlier = |bx: isize, by: isize| (dy, dx) < (by, bx);
+            #[allow(
+                clippy::float_cmp,
+                reason = "equal scores must pick the first point, as the full search does"
+            )]
+            let better =
+                |(bx, by, s): (isize, isize, f64)| score > s || (score == s && earlier(bx, by));
+            if best.is_none_or(better) {
                 best = Some((dx, dy, score));
             }
         }
     }
     let (dx, dy, score) = best?;
+    // Scores next to the best one, where they lie within the search.
+    let scores = |dx: isize, dy: isize| {
+        (dx.abs() <= reach && dy.abs() <= reach)
+            .then(|| cross_contrast(bitmap, at(dx, dy), axes, arm))
+            .flatten()
+    };
     // The top of a parabola through the best score and its two neighbours, per axis.
-    let top = |lower: Option<&f64>, middle: f64, upper: Option<&f64>| match (lower, upper) {
-        (Some(&l), Some(&u)) if 2.0 * middle - l - u > f64::EPSILON => {
+    let top = |lower: Option<f64>, middle: f64, upper: Option<f64>| match (lower, upper) {
+        (Some(l), Some(u)) if 2.0 * middle - l - u > f64::EPSILON => {
             0.5 * (l - u) / (l - 2.0 * middle + u)
         }
         _ => 0.0,
     };
-    let fine_x = top(scores.get(&(dx - 1, dy)), score, scores.get(&(dx + 1, dy)));
-    let fine_y = top(scores.get(&(dx, dy - 1)), score, scores.get(&(dx, dy + 1)));
+    let fine_x = top(scores(dx - 1, dy), score, scores(dx + 1, dy));
+    let fine_y = top(scores(dx, dy - 1), score, scores(dx, dy + 1));
     Some((
         (
             center.0 + dx as f64 + fine_x.clamp(-0.5, 0.5),
@@ -686,6 +713,7 @@ fn refine(
 
 /// How much darker than the paper beside them the lines through `point` are: the smaller
 /// of the contrast of the horizontal and of the vertical arm. `None` outside the picture.
+#[cfg_attr(feature = "profile", inline(never))]
 fn cross_contrast(bitmap: &Bitmap, point: Point, axes: Axes, arm: f64) -> Option<f64> {
     let horizontal = ridge(bitmap, point, axes.along_x, axes.along_y, arm)?;
     let vertical = ridge(bitmap, point, axes.along_y, axes.along_x, arm)?;
@@ -694,6 +722,7 @@ fn cross_contrast(bitmap: &Bitmap, point: Point, axes: Axes, arm: f64) -> Option
 
 /// The contrast of a dark line through `point` along `direction` (`side` is across it),
 /// averaged over `arm` pixels on both sides of the point.
+#[cfg_attr(feature = "profile", inline(never))]
 fn ridge(bitmap: &Bitmap, point: Point, direction: Point, side: Point, arm: f64) -> Option<f64> {
     let mut sum = 0.0;
     let mut count = 0.0;
@@ -717,6 +746,7 @@ fn ridge(bitmap: &Bitmap, point: Point, direction: Point, side: Point, arm: f64)
 }
 
 /// The brightness at a point between pixels (bilinear); `None` outside the picture.
+#[cfg_attr(feature = "profile", inline(never))]
 pub(crate) fn sample(bitmap: &Bitmap, (x, y): Point) -> Option<f64> {
     if x < 0.0 || y < 0.0 {
         return None;

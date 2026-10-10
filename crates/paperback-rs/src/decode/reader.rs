@@ -432,12 +432,13 @@ impl<'a> BlockReader<'a> {
             *row ^= row_mask(j);
         }
         let mut block = RawBlock::from_rows(&rows);
-        let corrected = block.correct().filter(|&n| n <= MAX_CORRECTIONS)?;
+        let corrected = block.correct_up_to(MAX_CORRECTIONS)?;
         block_crc_matches(&block).then_some((block, corrected))
     }
 
     /// The 32x32 dots of a block as gray levels, each the average of a few samples around
     /// the dot's place inside the quadrilateral.
+    #[cfg_attr(feature = "profile", inline(never))]
     fn sample_quad(&self, quad: &Quad, window: f64, shift: (f64, f64)) -> DotGrid {
         let cell = BLOCK_DOTS as f64 + 3.0;
         let pitch = {
@@ -649,6 +650,7 @@ impl<'a> BlockReader<'a> {
         outcome
     }
 
+    #[cfg_attr(feature = "profile", inline(never))]
     fn read_shifted(
         &mut self,
         column: usize,
@@ -664,9 +666,11 @@ impl<'a> BlockReader<'a> {
             + shift.1) as i32;
         let mut outcome = BlockOutcome::Missing;
         let levels = if every_level { self.boosts.len() } else { 1 };
+        // The block is cut out of the page once; each sharpness level starts from that cut.
+        self.resample(x0, y0);
         for boost in self.boosts.clone().into_iter().take(levels) {
             self.sharpness = (self.base_sharpness * boost.0 + boost.1).min(MAX_SHARPNESS);
-            self.resample(x0, y0);
+            self.apply_sharpness();
             let guided = shift != (0.0, 0.0) || tilt != 0.0;
             let found = self.locate_block();
             let predicted = found.is_none() && guided;
@@ -718,17 +722,13 @@ impl<'a> BlockReader<'a> {
         )
     }
 
-    /// Cuts the block out of the page, undoing the tilt by bilinear interpolation,
-    /// and sharpens it when the scan is blurred.
+    /// Cuts the block out of the page into `sharpened`, undoing the tilt by bilinear
+    /// interpolation. It is not sharpened yet; see [`Self::apply_sharpness`].
+    #[cfg_attr(feature = "profile", inline(never))]
     fn resample(&mut self, x0: i32, y0: i32) {
         let (bw, bh) = (self.buffer_width, self.buffer_height);
         let (sx, sy) = (self.bitmap.width() as i32, self.bitmap.height() as i32);
-        let sharpen = self.sharpness > 0.0;
-        let target = if sharpen {
-            &mut self.sharpened
-        } else {
-            &mut self.rotated
-        };
+        let target = &mut self.sharpened;
         let white = self.intensity.max as u8;
         for j in 0..bh {
             let x_exact = f64::from(x0) + f64::from(y0 + j as i32) * self.grid.x_angle;
@@ -759,35 +759,52 @@ impl<'a> BlockReader<'a> {
                 };
             }
         }
-        if sharpen {
+    }
+
+    /// Makes `rotated` from the cut-out block: sharpened when the level asks for it, else as it is.
+    fn apply_sharpness(&mut self) {
+        if self.sharpness > 0.0 {
             self.sharpen();
+        } else {
+            self.rotated.copy_from_slice(&self.sharpened);
         }
     }
 
+    /// Unsharp mask over the inside of the block; the outermost pixels are kept.
+    #[cfg_attr(feature = "profile", inline(never))]
     fn sharpen(&mut self) {
         let (bw, bh) = (self.buffer_width, self.buffer_height);
         let s = self.sharpness;
+        let gain = 1.0 + 4.0 * s;
         let (low, high) = (self.intensity.min, self.intensity.max);
-        for j in 0..bh {
-            for i in 0..bw {
-                let at = j * bw + i;
-                self.rotated[at] = if i == 0 || i == bw - 1 || j == 0 || j == bh - 1 {
-                    self.sharpened[at]
-                } else {
-                    let c = f64::from(self.sharpened[at]);
-                    let around = f64::from(self.sharpened[at - bw])
-                        + f64::from(self.sharpened[at - 1])
-                        + f64::from(self.sharpened[at + 1])
-                        + f64::from(self.sharpened[at + bw]);
-                    ((c * (1.0 + 4.0 * s) - around * s) as i32)
-                        .min(high)
-                        .max(low) as u8
-                };
+        let (source, target) = (&self.sharpened, &mut self.rotated);
+        target[..bw].copy_from_slice(&source[..bw]);
+        target[(bh - 1) * bw..].copy_from_slice(&source[(bh - 1) * bw..]);
+        for j in 1..bh - 1 {
+            let row = j * bw;
+            target[row] = source[row];
+            target[row + bw - 1] = source[row + bw - 1];
+            // Rows of equal length, so that the loop has no bounds checks and no branches.
+            let out = &mut target[row + 1..row + bw - 1];
+            let centre = &source[row + 1..row + bw - 1];
+            let up = &source[row - bw + 1..row - 1];
+            let down = &source[row + bw + 1..row + 2 * bw - 1];
+            let left = &source[row..row + bw - 2];
+            let right = &source[row + 2..row + bw];
+            for i in 0..bw - 2 {
+                let around = f64::from(up[i])
+                    + f64::from(left[i])
+                    + f64::from(right[i])
+                    + f64::from(down[i]);
+                out[i] = ((f64::from(centre[i]) * gain - around * s) as i32)
+                    .min(high)
+                    .max(low) as u8;
             }
         }
     }
 
     /// Finds the exact grid lines of this block; `None` if there is no grid.
+    #[cfg_attr(feature = "profile", inline(never))]
     fn locate_block(&self) -> Option<BlockFit> {
         let (bw, bh) = (self.buffer_width, self.buffer_height);
         let mut column_sums = vec![0i32; bw];
@@ -817,16 +834,24 @@ impl<'a> BlockReader<'a> {
         })
     }
 
+    #[cfg_attr(feature = "profile", inline(never))]
     fn read_dots(&mut self, fit: &BlockFit) -> Option<(RawBlock, usize)> {
         for dot_size in 1..=self.max_dot_size {
-            let shifted = self.sample_shifted_grids(fit, dot_size);
-            if let Some(found) = self.recognise(&shifted[CENTER_SHIFT]) {
+            // Most blocks read from the unshifted sampling; the other eight are sampled only
+            // for those that do not.
+            let centre = self.sample_grid(fit, dot_size, CENTER_SHIFT);
+            if let Some(found) = self.recognise(&centre) {
                 return Some(found);
             }
             if self.effort == Effort::Quick {
                 continue;
             }
-            if let Some(found) = self.recognise(&best_focused_grid(&shifted)) {
+            let shifted = self.sample_shifted_grids(fit, dot_size);
+            let focused = best_focused_grid(&shifted);
+            // The same samples as before would only fail again.
+            if focused != centre
+                && let Some(found) = self.recognise(&focused)
+            {
                 return Some(found);
             }
         }
@@ -835,19 +860,25 @@ impl<'a> BlockReader<'a> {
 
     /// Samples the 32x32 dots nine times, shifted by up to one pixel in every direction.
     fn sample_shifted_grids(&self, fit: &BlockFit, dot_size: usize) -> Vec<DotGrid> {
+        (0..SHIFT_COUNT)
+            .map(|shift| self.sample_grid(fit, dot_size, shift))
+            .collect()
+    }
+
+    /// Samples the 32x32 dots once, shifted as number `shift` of the nine says.
+    #[cfg_attr(feature = "profile", inline(never))]
+    fn sample_grid(&self, fit: &BlockFit, dot_size: usize, shift: usize) -> DotGrid {
         let half_dot = dot_size as f64 / 2.0 - 1.0;
-        let mut grids = vec![[[0u8; BLOCK_DOTS]; BLOCK_DOTS]; SHIFT_COUNT];
-        for j in 0..BLOCK_DOTS {
+        let (dy, dx) = ((shift / 3) as i32 - 1, (shift % 3) as i32 - 1);
+        let mut grid = [[0u8; BLOCK_DOTS]; BLOCK_DOTS];
+        for (j, row) in grid.iter_mut().enumerate() {
             let y = (fit.y_origin + fit.y_pitch * j as f64 - half_dot) as i32;
-            for i in 0..BLOCK_DOTS {
+            for (i, dot) in row.iter_mut().enumerate() {
                 let x = (fit.x_origin + fit.x_pitch * i as f64 - half_dot) as i32;
-                for (shift, grid) in grids.iter_mut().enumerate() {
-                    let (dy, dx) = ((shift / 3) as i32 - 1, (shift % 3) as i32 - 1);
-                    grid[j][i] = self.average_dot(x + dx, y + dy, dot_size);
-                }
+                *dot = self.average_dot(x + dx, y + dy, dot_size);
             }
         }
-        grids
+        grid
     }
 
     fn pixel(&self, x: i32, y: i32) -> i32 {
@@ -857,6 +888,7 @@ impl<'a> BlockReader<'a> {
         i32::from(self.rotated[y as usize * self.buffer_width + x as usize])
     }
 
+    #[cfg_attr(feature = "profile", inline(never))]
     fn average_dot(&self, x: i32, y: i32, dot_size: usize) -> u8 {
         let sum_of = |cells: &[(i32, i32)]| -> i32 {
             cells
@@ -914,6 +946,7 @@ impl<'a> BlockReader<'a> {
     /// orientations of [`orient`] count in the transposed picture, because the neighbour
     /// correction of the original reads the centre dot transposed (see `overlap_corrected`);
     /// the detector works on the samples as they are, hence `b` before `a` below.
+    #[cfg_attr(feature = "profile", inline(never))]
     fn learn_from(&mut self, grid: &DotGrid, block: &RawBlock) {
         let Some(orientation) = self.orientation else {
             return;
@@ -932,6 +965,7 @@ impl<'a> BlockReader<'a> {
 
     /// Reads the dots with the detector fitted to this page, and repairs the bits, with the
     /// bytes it was least sure about as erasures if need be.
+    #[cfg_attr(feature = "profile", inline(never))]
     fn recognise_learned(&self, grid: &DotGrid) -> Option<(RawBlock, usize)> {
         let orientation = self.orientation?;
         if !self.detector.is_ready() {
@@ -954,7 +988,7 @@ impl<'a> BlockReader<'a> {
         }
         let block = RawBlock::from_rows(&rows);
         let mut direct = block.clone();
-        if let Some(corrected) = direct.correct().filter(|&n| n <= MAX_CORRECTIONS)
+        if let Some(corrected) = direct.correct_up_to(MAX_CORRECTIONS)
             && block_crc_matches(&direct)
         {
             return Some((direct, corrected));
@@ -965,7 +999,12 @@ impl<'a> BlockReader<'a> {
     /// Turns sampled gray levels into bits and repairs them. Tries every
     /// orientation until one is known, and several neighbour-overlap and
     /// threshold variants, starting with the one that worked last.
+    #[cfg_attr(feature = "profile", inline(never))]
     fn recognise_by_threshold(&mut self, grid: &DotGrid) -> Option<(RawBlock, usize)> {
+        // The neighbour correction does not depend on the orientation or on whether the limit is
+        // taken per quadrant, so each variant needs it once per grid.
+        let mut corrected_grids: [Option<Adjusted>; THRESHOLD_VARIANTS] =
+            std::array::from_fn(|_| None);
         for orientation in 0..ORIENTATIONS {
             if self.orientation.is_some_and(|known| known != orientation) {
                 continue;
@@ -983,9 +1022,11 @@ impl<'a> BlockReader<'a> {
             for (attempt, local) in tries {
                 let variant = (attempt + self.last_good_variant) % THRESHOLD_VARIANTS;
                 let (weight, threshold_shift) = self.variant_parameters(variant);
-                let adjusted = overlap_corrected(grid, weight, self.intensity.max);
+                let white = self.intensity.max;
+                let adjusted = corrected_grids[variant]
+                    .get_or_insert_with(|| overlap_corrected(grid, weight, white));
                 let limits = if local {
-                    quadrant_limits(&adjusted, threshold_shift * weight)
+                    quadrant_limits(adjusted, threshold_shift * weight)
                 } else {
                     let whole =
                         adjusted.iter().flatten().sum::<i32>() / 1024 + threshold_shift * weight;
@@ -1009,7 +1050,7 @@ impl<'a> BlockReader<'a> {
                 if attempt == 0 && !local {
                     doubtful = Some((block.clone(), certainty));
                 }
-                let Some(corrected) = block.correct().filter(|&n| n <= MAX_CORRECTIONS) else {
+                let Some(corrected) = block.correct_up_to(MAX_CORRECTIONS) else {
                     continue;
                 };
                 if block_crc_matches(&block) {
@@ -1056,7 +1097,11 @@ const QUADRANT: usize = BLOCK_DOTS / 2;
 /// Quadrants of a block.
 const QUADRANTS: usize = 4;
 
-fn quadrant_limits(adjusted: &[[i32; BLOCK_DOTS]; BLOCK_DOTS], shift: i32) -> [[i32; 2]; 2] {
+/// The gray levels of a block after the neighbours' brightness is subtracted.
+type Adjusted = [[i32; BLOCK_DOTS]; BLOCK_DOTS];
+
+#[cfg_attr(feature = "profile", inline(never))]
+fn quadrant_limits(adjusted: &Adjusted, shift: i32) -> [[i32; 2]; 2] {
     let mut limits = [[0; 2]; 2];
     for (q_row, limit_row) in limits.iter_mut().enumerate() {
         for (q_col, limit) in limit_row.iter_mut().enumerate() {
@@ -1078,6 +1123,7 @@ const ERASURE_COUNTS: [usize; 2] = [16, 24];
 
 /// Tries the least certain bytes of `block` as erasures; the repaired block must pass its
 /// checksum. Returns it with the number of bytes that changed.
+#[cfg_attr(feature = "profile", inline(never))]
 fn repair_doubtful_bytes(
     block: &RawBlock,
     certainty: &[i32; BLOCK_LEN],
@@ -1094,6 +1140,7 @@ fn repair_doubtful_bytes(
     })
 }
 
+#[cfg_attr(feature = "profile", inline(never))]
 fn block_crc_matches(block: &RawBlock) -> bool {
     debug_assert_eq!(ECC_PAD + 1, 128);
     crc16(&block.0[..CRC_COVERED]) ^ CRC_MASK
@@ -1118,7 +1165,8 @@ fn orient(orientation: usize, j: usize, i: usize) -> (usize, usize) {
 
 /// Subtracts the neighbours' brightness to undo dots bleeding into each other.
 /// Indexing mirrors the original program exactly.
-fn overlap_corrected(grid: &DotGrid, weight: i32, white: i32) -> [[i32; BLOCK_DOTS]; BLOCK_DOTS] {
+#[cfg_attr(feature = "profile", inline(never))]
+fn overlap_corrected(grid: &DotGrid, weight: i32, white: i32) -> Adjusted {
     let last = BLOCK_DOTS - 1;
     let mut result = [[0i32; BLOCK_DOTS]; BLOCK_DOTS];
     for j in 0..BLOCK_DOTS {
@@ -1152,6 +1200,7 @@ fn overlap_corrected(grid: &DotGrid, weight: i32, white: i32) -> [[i32; BLOCK_DO
 
 /// Assembles a grid from the shifted version with the strongest contrast in
 /// each 8x8 sub-block; this compensates small distortions of the scan.
+#[cfg_attr(feature = "profile", inline(never))]
 fn best_focused_grid(shifted: &[DotGrid]) -> DotGrid {
     let mut combined = [[0u8; BLOCK_DOTS]; BLOCK_DOTS];
     for top in (0..BLOCK_DOTS).step_by(SUBBLOCK_SIZE) {

@@ -102,8 +102,15 @@ impl RawBlock {
     }
 
     /// Repairs the block in place; returns the number of corrected bytes.
+    #[cfg(test)]
     pub(crate) fn correct(&mut self) -> Option<usize> {
         reed_solomon::decode(&mut self.0, ECC_PAD)
+    }
+
+    /// Repairs the block in place if at most `max` bytes are wrong; returns the number of
+    /// corrected bytes. Quicker than [`Self::correct`] for blocks that are beyond repair.
+    pub(crate) fn correct_up_to(&mut self, max: usize) -> Option<usize> {
+        reed_solomon::decode_up_to(&mut self.0, ECC_PAD, max)
     }
 
     /// Repairs the block in place when the bytes at `erased` are probably the damaged ones.

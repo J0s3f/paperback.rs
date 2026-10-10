@@ -18,6 +18,10 @@ exclude = ["tests/fixtures/realworld/scans/*", "tests/fixtures/synthetic/*.png"]
 [lints]
 workspace = true
 
+# Stops the compiler from inlining the functions the profile has to tell apart (tools/profile.ps1).
+[features]
+profile = []
+
 [dependencies]
 aes = "0.9.2"
 bzip2 = "0.6.1"

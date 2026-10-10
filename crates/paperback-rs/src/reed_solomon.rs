@@ -33,6 +33,14 @@ const GENERATOR: [u8; PARITY_LEN + 1] = [
 struct Field {
     alpha: [u8; FIELD_ORDER + 1],
     index: [u8; FIELD_ORDER + 1],
+    /// `syndrome_step[i][s]` is `s` times the `i`-th root of the code: one step of the evaluation
+    /// of the received word at that root, without logarithms.
+    syndrome_step: [[u8; 256]; PARITY_LEN],
+    /// `product[a][b]` is `a * b`.
+    product: Vec<[u8; 256]>,
+    /// `locator_power[j][p]` is `alpha^(j * (p + 1))`: the `j`-th term of the error locator
+    /// polynomial at the `p`-th place of the search for its roots.
+    locator_power: Vec<[u8; FIELD_ORDER]>,
 }
 
 fn field() -> &'static Field {
@@ -49,13 +57,40 @@ fn field() -> &'static Field {
                 element ^= FIELD_POLYNOMIAL;
             }
         }
-        Field { alpha, index }
+        let mut syndrome_step = [[0u8; 256]; PARITY_LEN];
+        for (i, row) in syndrome_step.iter_mut().enumerate() {
+            let root = (FIRST_ROOT + i) * ROOT_STEP;
+            for (value, product) in row.iter_mut().enumerate().skip(1) {
+                *product = alpha[(index[value] as usize + root) % FIELD_ORDER];
+            }
+        }
+        let product = (0..256usize)
+            .map(|a| {
+                std::array::from_fn(|b| {
+                    if a == 0 || b == 0 {
+                        0
+                    } else {
+                        alpha[(index[a] as usize + index[b] as usize) % FIELD_ORDER]
+                    }
+                })
+            })
+            .collect();
+        let locator_power = (0..=PARITY_LEN)
+            .map(|j| std::array::from_fn(|p| alpha[(j * (p + 1)) % FIELD_ORDER]))
+            .collect();
+        Field {
+            alpha,
+            index,
+            syndrome_step,
+            product,
+            locator_power,
+        }
     })
 }
 
 /// Computes the parity of the first `MESSAGE_LEN - pad` bytes of `data`.
 pub(crate) fn encode(data: &[u8], pad: usize) -> [u8; PARITY_LEN] {
-    let Field { alpha, index } = field();
+    let Field { alpha, index, .. } = field();
     let mut parity = [0u8; PARITY_LEN];
     for &byte in &data[..MESSAGE_LEN - pad] {
         let feedback = index[(byte ^ parity[0]) as usize] as usize;
@@ -77,8 +112,16 @@ pub(crate) fn encode(data: &[u8], pad: usize) -> [u8; PARITY_LEN] {
 /// Corrects `data` (message followed by parity, `CODEWORD_LEN - pad` bytes) in
 /// place. Returns the number of corrected bytes, or `None` if the block is
 /// beyond repair.
+#[cfg(test)]
 pub(crate) fn decode(data: &mut [u8], pad: usize) -> Option<usize> {
     decode_with_erasures(data, pad, &[])
+}
+
+/// Like [`decode`], but gives up as soon as it is clear that more than `max_corrections` bytes
+/// are wrong. Most blocks that are tried are not blocks at all (the wrong turn of the page, the
+/// wrong threshold), and for those this saves searching for the error positions.
+pub(crate) fn decode_up_to(data: &mut [u8], pad: usize, max_corrections: usize) -> Option<usize> {
+    decode_limited(data, pad, &[], max_corrections)
 }
 
 /// Like [`decode`], for bytes at known positions that are probably damaged (their dots
@@ -94,22 +137,38 @@ pub(crate) fn decode_with_erasures(
     pad: usize,
     erasures: &[usize],
 ) -> Option<usize> {
+    decode_limited(data, pad, erasures, PARITY_LEN)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "a close port of the original routine; splitting it would hide the correspondence"
+)]
+#[cfg_attr(feature = "profile", inline(never))]
+fn decode_limited(
+    data: &mut [u8],
+    pad: usize,
+    erasures: &[usize],
+    max_corrections: usize,
+) -> Option<usize> {
     if erasures.len() > PARITY_LEN || erasures.iter().any(|&at| at >= CODEWORD_LEN - pad) {
         return None;
     }
-    let Field { alpha, index } = field();
+    let Field {
+        alpha,
+        index,
+        syndrome_step,
+        product,
+        locator_power,
+    } = field();
     let log = |value: u8| index[value as usize];
     let exp = |power: usize| alpha[power % FIELD_ORDER];
 
     let mut syndrome = [0u8; PARITY_LEN];
     syndrome.fill(data[0]);
     for &byte in &data[1..CODEWORD_LEN - pad] {
-        for (i, s) in syndrome.iter_mut().enumerate() {
-            *s = if *s == 0 {
-                byte
-            } else {
-                byte ^ exp(log(*s) as usize + (FIRST_ROOT + i) * ROOT_STEP)
-            };
+        for (s, step) in syndrome.iter_mut().zip(syndrome_step) {
+            *s = byte ^ step[*s as usize];
         }
     }
     let mut syndrome_nonzero = 0u8;
@@ -143,7 +202,12 @@ pub(crate) fn decode_with_erasures(
     let mut el = erasures.len();
     for r in erasures.len() + 1..=PARITY_LEN {
         let mut discrepancy = 0u8;
-        for i in 0..r {
+        // Beyond the highest non-zero coefficient there is nothing to add.
+        let reach = lambda
+            .iter()
+            .rposition(|&l| l != 0)
+            .map_or(0, |top| top + 1);
+        for i in 0..r.min(reach) {
             if lambda[i] != 0 && syndrome[r - i - 1] != ZERO_LOG {
                 discrepancy ^= exp(log(lambda[i]) as usize + syndrome[r - i - 1] as usize);
             }
@@ -179,6 +243,7 @@ pub(crate) fn decode_with_erasures(
         }
     }
 
+    let linear_lambda = lambda;
     let mut degree = 0usize;
     for (i, l) in lambda.iter_mut().enumerate() {
         *l = log(*l);
@@ -186,22 +251,29 @@ pub(crate) fn decode_with_erasures(
             degree = i;
         }
     }
+    // More errors than the caller can use: no need to look for where they are.
+    if degree > max_corrections {
+        return None;
+    }
 
-    let mut reg = [0u8; PARITY_LEN + 1];
-    reg[1..].copy_from_slice(&lambda[1..]);
+    // The error locator polynomial at every place of the search at once: its terms are added
+    // up one coefficient after the other, each a table row times a fixed row of powers.
+    let mut values = [1u8; FIELD_ORDER];
+    for (j, &coefficient) in linear_lambda.iter().enumerate().take(degree + 1).skip(1) {
+        if coefficient == 0 {
+            continue;
+        }
+        let times = &product[coefficient as usize];
+        for (value, &power) in values.iter_mut().zip(&locator_power[j]) {
+            *value ^= times[power as usize];
+        }
+    }
     let mut roots = [0usize; PARITY_LEN];
     let mut locations = [0usize; PARITY_LEN];
     let mut count = 0usize;
     let mut k = 115usize;
-    for i in 1..=FIELD_ORDER {
-        let mut q = 1u8;
-        for j in (1..=degree).rev() {
-            if reg[j] != ZERO_LOG {
-                reg[j] = ((reg[j] as usize + j) % FIELD_ORDER) as u8;
-                q ^= alpha[reg[j] as usize];
-            }
-        }
-        if q == 0 {
+    for (i, &value) in (1..=FIELD_ORDER).zip(&values) {
+        if value == 0 {
             roots[count] = i;
             locations[count] = k;
             count += 1;
@@ -273,7 +345,7 @@ mod tests {
 
     #[test]
     fn field_tables_match_the_reference_values() {
-        let Field { alpha, index } = field();
+        let Field { alpha, index, .. } = field();
         assert_eq!(
             &alpha[..10],
             &[0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x87, 0x89]
