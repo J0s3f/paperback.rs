@@ -373,10 +373,13 @@ and on the corrected bytes.
 - Berlekamp-Massey keeps its polynomials as they are, not as logarithms, so that the update is one multiplication of a row by a
   constant; the search for the roots of the locator polynomial adds up rows of powers times its coefficients.
 - A call on a word that is not a codeword (`cargo test --release -- --ignored --nocapture decoder_speed`): 5.4 microseconds
-  before, 4.1 plain, 2.2 with SSSE3, 2.0 with AVX2. GFNI cannot be run on the machine this was written on (AMD Zen 3: AVX2, no
-  GFNI), so it is tested there against a software model of the instruction (the bit matrices multiply as claimed for every
-  constant) and on another machine with the same tests: `cargo test -p paperback-rs --release --lib simd` shows with
-  `--nocapture` which levels were tried.
+  before, 4.1 plain, 2.2 with SSSE3, 2.0 with AVX2. GFNI was tried on a second machine (AMD EPYC Genoa, which has it): the
+  whole test suite passes with GFNI in use, and the same
+  call took 4.8 microseconds plain, 2.8 with SSSE3, 2.6 with AVX2 and 2.6 with GFNI. So GFNI gives the same bytes but, on this
+  processor, no measurable speed over AVX2 (one run, not repeated).
+  On the first machine, which lacks GFNI, the kernel is tested against a software model of the instruction (the bit matrices
+  multiply as claimed for every constant). `cargo test -p paperback-rs --release --lib simd -- --nocapture` shows which levels
+  were tried.
 - Eight pictures, seconds: 212 before this step, 176 with AVX2, 197 with the plain code, 450 at the start of the speed work, all with
   the same blocks read.
 
