@@ -95,10 +95,16 @@ fn encrypted_file_needs_the_right_password() {
         password: Some("other".into()),
         ..DecodeOptions::default()
     };
-    assert!(matches!(
-        decode(&pages, &wrong, |_| {}),
-        Err(paperback_rs::Error::WrongPassword)
-    ));
+    // The 16-bit checksum of the format lets a wrong password through once in 65536 times; the
+    // hash on the pages, keyed with the password, then refuses the file.
+    let refused = decode(&pages, &wrong, |_| {});
+    assert!(
+        matches!(
+            refused,
+            Err(paperback_rs::Error::WrongPassword | paperback_rs::Error::HashMismatch)
+        ),
+        "{refused:?}"
+    );
     assert!(matches!(
         decode(&pages, &DecodeOptions::default(), |_| {}),
         Err(paperback_rs::Error::PasswordRequired)

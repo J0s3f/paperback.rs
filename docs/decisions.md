@@ -387,3 +387,26 @@ What is left that vectors could do: the rest of the time is the corner search (b
 needed to vectorise it, which would change what is read), cutting out blocks and sharpening (plain loops the compiler vectorises
 when the build is allowed AVX2: about 8% in an experiment, which the run-time choice cannot give them), and the discrepancy
 step of Berlekamp-Massey (a dot product of two vectors, which would want `gf2p8mulb` and a change of basis to the field of AES).
+
+### Further steps after the vector code
+
+Profile after the vector code (eight pictures, 195 s of CPU): cutting a block out of the page 18%, the corner search 21%,
+turning gray levels into bits 10.5%, Reed-Solomon 13%, sharpening 7%, averaging the dots 8%. Changes with the same blocks on
+every picture:
+
+- cutting out: the rise of each column, the pixel index and the row of the bitmap are worked out once instead of for every
+  pixel; averaging a dot needs no check of its pixels when it lies well inside the buffer; the neighbour correction runs over
+  rows with a white border added, without a test for the edge;
+- turning gray levels into bits: the sums behind the limits are made once per variant, the orientations are looked up in
+  tables instead of computed per dot, and how sure each byte is (needed only by the repair of the first reading) is worked
+  out only then.
+
+Eight pictures, seconds: 176 before, 167 after the cutting out, 162 after the bits. Tried and dropped: a 64 KB multiplication
+table for the discrepancy of Berlekamp-Massey (2.2 microseconds per call against 2.05 with logarithms: the table costs more in
+cache misses than it saves in lookups).
+
+What is left is mostly the corner search and the blocks themselves, and one thing they share: everything runs on one thread.
+The reads of the cells of a page are independent in principle, but the reader learns as it goes (the orientation, the variant that
+worked last, the shifts of the neighbours that later reads start from), so reading them in parallel would change which variant
+succeeds first in marginal cases and with it the blocks read; the search windows of the corner search are independent and could
+be spread over threads with the same results.

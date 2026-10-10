@@ -5,11 +5,14 @@
 //! Reads blocks out of a located grid: resampling, sharpening, dot sampling
 //! and error correction.
 
+use std::sync::OnceLock;
+
 use super::bitmap::Bitmap;
 use super::detector::DotDetector;
 use super::grid::{Grid, Intensity};
 use super::mesh::{Mesh, Quad, sample};
 use super::peaks::find_peaks;
+
 use crate::block::{BLOCK_DOTS, BLOCK_LEN, RawBlock, row_mask};
 use crate::crc::crc16;
 
@@ -730,31 +733,36 @@ impl<'a> BlockReader<'a> {
         let (sx, sy) = (self.bitmap.width() as i32, self.bitmap.height() as i32);
         let target = &mut self.sharpened;
         let white = self.intensity.max as u8;
-        for j in 0..bh {
-            let x_exact = f64::from(x0) + f64::from(y0 + j as i32) * self.grid.x_angle;
+        let (pixels, width) = (self.bitmap.pixels(), self.bitmap.width());
+        // How far each column of the block lies above or below its row because of the tilt.
+        let column_rise: Vec<f64> = (0..bw)
+            .map(|i| f64::from(x0 + i as i32) * self.grid.y_angle)
+            .collect();
+        for (j, out) in target.chunks_exact_mut(bw).take(bh).enumerate() {
+            let row = f64::from(y0 + j as i32);
+            let x_exact = f64::from(x0) + row * self.grid.x_angle;
             let x_whole = if x_exact >= 0.0 {
                 x_exact as i32
             } else {
                 (x_exact - 1.0) as i32
             };
             let x_fraction = x_exact - f64::from(x_whole);
-            for i in 0..bw {
+            for (i, (slot, &rise)) in out.iter_mut().zip(&column_rise).enumerate() {
                 let x = x_whole + i as i32;
-                let y_exact =
-                    f64::from(y0 + j as i32) + f64::from(x0 + i as i32) * self.grid.y_angle;
+                let y_exact = row + rise;
                 let y = if y_exact > 0.0 {
                     y_exact as i32
                 } else {
                     (y_exact - 1.0) as i32
                 };
-                let y_fraction = y_exact - f64::from(y);
-                target[j * bw + i] = if x < 0 || x >= sx - 1 || y < 0 || y >= sy - 1 {
+                *slot = if x < 0 || x >= sx - 1 || y < 0 || y >= sy - 1 {
                     white
                 } else {
-                    let (x, y) = (x as usize, y as usize);
-                    let p = |dx: usize, dy: usize| f64::from(self.bitmap.at(x + dx, y + dy));
-                    ((p(0, 0) + (p(1, 0) - p(0, 0)) * x_fraction) * (1.0 - y_fraction)
-                        + (p(0, 1) + (p(1, 1) - p(0, 1)) * x_fraction) * y_fraction)
+                    let y_fraction = y_exact - f64::from(y);
+                    let at = y as usize * width + x as usize;
+                    let p = |offset: usize| f64::from(pixels[at + offset]);
+                    ((p(0) + (p(1) - p(0)) * x_fraction) * (1.0 - y_fraction)
+                        + (p(width) + (p(width + 1) - p(width)) * x_fraction) * y_fraction)
                         as u8
                 };
             }
@@ -890,6 +898,35 @@ impl<'a> BlockReader<'a> {
 
     #[cfg_attr(feature = "profile", inline(never))]
     fn average_dot(&self, x: i32, y: i32, dot_size: usize) -> u8 {
+        let (width, height) = (self.buffer_width, self.buffer_height);
+        // Well inside the buffer, which is nearly always, no pixel needs a check.
+        if x >= 0 && y >= 0 && (x as usize) + 3 < width && (y as usize) + 3 < height {
+            let at = y as usize * width + x as usize;
+            let p = |dx: usize, dy: usize| i32::from(self.rotated[at + dy * width + dx]);
+            return match dot_size {
+                4 => {
+                    ((p(1, 0) + p(2, 0))
+                        + (p(0, 1) + p(1, 1) + p(2, 1) + p(3, 1))
+                        + (p(0, 2) + p(1, 2) + p(2, 2) + p(3, 2))
+                        + (p(1, 3) + p(2, 3)))
+                        / 12
+                }
+                3 => {
+                    (p(0, 0)
+                        + p(1, 0)
+                        + p(2, 0)
+                        + p(0, 1)
+                        + p(1, 1)
+                        + p(2, 1)
+                        + p(0, 2)
+                        + p(1, 2)
+                        + p(2, 2))
+                        / 9
+                }
+                2 => (p(0, 0) + p(1, 0) + p(0, 1) + p(1, 1)) / 4,
+                _ => p(0, 0),
+            } as u8;
+        }
         let sum_of = |cells: &[(i32, i32)]| -> i32 {
             cells
                 .iter()
@@ -1003,7 +1040,7 @@ impl<'a> BlockReader<'a> {
     fn recognise_by_threshold(&mut self, grid: &DotGrid) -> Option<(RawBlock, usize)> {
         // The neighbour correction does not depend on the orientation or on whether the limit is
         // taken per quadrant, so each variant needs it once per grid.
-        let mut corrected_grids: [Option<Adjusted>; THRESHOLD_VARIANTS] =
+        let mut corrected_grids: [Option<Corrected>; THRESHOLD_VARIANTS] =
             std::array::from_fn(|_| None);
         // Words that did not decode: a variant that reads the same dots gives the same word.
         let mut failed: Vec<RawBlock> = Vec::new();
@@ -1025,32 +1062,23 @@ impl<'a> BlockReader<'a> {
                 let variant = (attempt + self.last_good_variant) % THRESHOLD_VARIANTS;
                 let (weight, threshold_shift) = self.variant_parameters(variant);
                 let white = self.intensity.max;
-                let adjusted = corrected_grids[variant]
-                    .get_or_insert_with(|| overlap_corrected(grid, weight, white));
-                let limits = if local {
-                    quadrant_limits(adjusted, threshold_shift * weight)
-                } else {
-                    let whole =
-                        adjusted.iter().flatten().sum::<i32>() / 1024 + threshold_shift * weight;
-                    [[whole; 2]; 2]
-                };
+                let corrected_grid = corrected_grids[variant]
+                    .get_or_insert_with(|| Corrected::of(grid, weight, white));
+                let limits = corrected_grid.limits(local, threshold_shift * weight);
+                let adjusted = &corrected_grid.adjusted;
+                let map = orientation_map(orientation);
                 let mut rows = [0u32; BLOCK_DOTS];
-                let mut certainty = [i32::MAX; BLOCK_LEN];
                 for (j, row) in rows.iter_mut().enumerate() {
-                    for i in 0..BLOCK_DOTS {
-                        let (a, b) = orient(orientation, j, i);
-                        let limit = limits[a / QUADRANT][b / QUADRANT];
-                        if adjusted[a][b] < limit {
-                            *row |= 1 << i;
-                        }
-                        let byte = j * 4 + i / 8;
-                        certainty[byte] = certainty[byte].min((adjusted[a][b] - limit).abs());
+                    for (i, &(a, b)) in map[j].iter().enumerate() {
+                        let limit = limits[usize::from(a) / QUADRANT][usize::from(b) / QUADRANT];
+                        *row |= u32::from(adjusted[usize::from(a)][usize::from(b)] < limit) << i;
                     }
                     *row ^= row_mask(j);
                 }
                 let mut block = RawBlock::from_rows(&rows);
+                // How sure each byte is matters only to the repair of the first reading.
                 if attempt == 0 && !local {
-                    doubtful = Some((block.clone(), certainty));
+                    doubtful = Some((block.clone(), certainty_of(adjusted, &limits, map)));
                 }
                 if failed.contains(&block) {
                     continue;
@@ -1108,19 +1136,80 @@ const QUADRANTS: usize = 4;
 /// The gray levels of a block after the neighbours' brightness is subtracted.
 type Adjusted = [[i32; BLOCK_DOTS]; BLOCK_DOTS];
 
-#[cfg_attr(feature = "profile", inline(never))]
-fn quadrant_limits(adjusted: &Adjusted, shift: i32) -> [[i32; 2]; 2] {
-    let mut limits = [[0; 2]; 2];
-    for (q_row, limit_row) in limits.iter_mut().enumerate() {
-        for (q_col, limit) in limit_row.iter_mut().enumerate() {
-            let sum: i32 = adjusted[q_row * QUADRANT..(q_row + 1) * QUADRANT]
-                .iter()
-                .flat_map(|row| &row[q_col * QUADRANT..(q_col + 1) * QUADRANT])
-                .sum();
-            *limit = sum / (QUADRANT * QUADRANT) as i32 + shift;
+/// A block's gray levels after the neighbour correction, with what the black and white limits are
+/// made of: the sum over the whole block and over each quadrant.
+struct Corrected {
+    adjusted: Adjusted,
+    total: i32,
+    quadrants: [[i32; 2]; 2],
+}
+
+impl Corrected {
+    fn of(grid: &DotGrid, weight: i32, white: i32) -> Self {
+        let adjusted = overlap_corrected(grid, weight, white);
+        let mut quadrants = [[0i32; 2]; 2];
+        for (j, row) in adjusted.iter().enumerate() {
+            for (q_col, half) in row.as_chunks::<QUADRANT>().0.iter().enumerate() {
+                quadrants[j / QUADRANT][q_col] += half.iter().sum::<i32>();
+            }
+        }
+        let total = quadrants.iter().flatten().sum();
+        Self {
+            adjusted,
+            total,
+            quadrants,
         }
     }
-    limits
+
+    /// The limit between black and white of each quadrant: the mean of the block or of the
+    /// quadrant, moved by `shift`.
+    fn limits(&self, per_quadrant: bool, shift: i32) -> [[i32; 2]; 2] {
+        if per_quadrant {
+            self.quadrants
+                .map(|row| row.map(|sum| sum / (QUADRANT * QUADRANT) as i32 + shift))
+        } else {
+            [[self.total / 1024 + shift; 2]; 2]
+        }
+    }
+}
+
+/// How far the gray level of the dots of each byte of a block is from the limit, the least of
+/// the eight; small means that the byte may have been read wrongly.
+fn certainty_of(
+    adjusted: &Adjusted,
+    limits: &[[i32; 2]; 2],
+    map: &OrientationMap,
+) -> [i32; BLOCK_LEN] {
+    let mut certainty = [i32::MAX; BLOCK_LEN];
+    for (j, row) in map.iter().enumerate() {
+        for (i, &(a, b)) in row.iter().enumerate() {
+            let (a, b) = (usize::from(a), usize::from(b));
+            let limit = limits[a / QUADRANT][b / QUADRANT];
+            let byte = j * 4 + i / 8;
+            certainty[byte] = certainty[byte].min((adjusted[a][b] - limit).abs());
+        }
+    }
+    certainty
+}
+
+/// For each place of a block as it is read in one of the eight orientations, the dot of the
+/// sampled grid that goes there (see [`orient`]).
+type OrientationMap = [[(u8, u8); BLOCK_DOTS]; BLOCK_DOTS];
+
+fn orientation_map(orientation: usize) -> &'static OrientationMap {
+    static MAPS: OnceLock<Vec<OrientationMap>> = OnceLock::new();
+    &MAPS.get_or_init(|| {
+        (0..ORIENTATIONS)
+            .map(|o| {
+                std::array::from_fn(|j| {
+                    std::array::from_fn(|i| {
+                        let (a, b) = orient(o, j, i);
+                        (a as u8, b as u8)
+                    })
+                })
+            })
+            .collect()
+    })[orientation]
 }
 
 /// Erased bytes tried for a block that does not read as it is. Each erased byte costs one
@@ -1176,31 +1265,31 @@ fn orient(orientation: usize, j: usize, i: usize) -> (usize, usize) {
 #[cfg_attr(feature = "profile", inline(never))]
 fn overlap_corrected(grid: &DotGrid, weight: i32, white: i32) -> Adjusted {
     let last = BLOCK_DOTS - 1;
-    let mut result = [[0i32; BLOCK_DOTS]; BLOCK_DOTS];
-    for j in 0..BLOCK_DOTS {
-        for i in 0..BLOCK_DOTS {
-            let mut c = i32::from(grid[i][j]) * weight;
-            c -= if i > 0 {
+    // Rows with a white dot added at both ends, and a white row beyond the first and the last,
+    // so that the loop below needs no test for the edge.
+    let padded: [[i32; BLOCK_DOTS + 2]; BLOCK_DOTS] = std::array::from_fn(|j| {
+        std::array::from_fn(|i| {
+            if (1..=BLOCK_DOTS).contains(&i) {
                 i32::from(grid[j][i - 1])
             } else {
                 white
-            };
-            c -= if i < last {
-                i32::from(grid[j][i + 1])
-            } else {
-                white
-            };
-            c -= if j > 0 {
-                i32::from(grid[j - 1][i])
-            } else {
-                white
-            };
-            c -= if j < last {
-                i32::from(grid[j + 1][i])
-            } else {
-                white
-            };
-            result[j][i] = c;
+            }
+        })
+    });
+    let blank = [white; BLOCK_DOTS + 2];
+    // The dot itself is read with its row and column swapped, as the original does.
+    let transposed: DotGrid = std::array::from_fn(|j| std::array::from_fn(|i| grid[i][j]));
+    let mut result = [[0i32; BLOCK_DOTS]; BLOCK_DOTS];
+    for (j, out) in result.iter_mut().enumerate() {
+        let here = &padded[j];
+        let above = if j > 0 { &padded[j - 1] } else { &blank };
+        let below = if j < last { &padded[j + 1] } else { &blank };
+        for i in 0..BLOCK_DOTS {
+            out[i] = i32::from(transposed[j][i]) * weight
+                - here[i]
+                - here[i + 2]
+                - above[i + 1]
+                - below[i + 1];
         }
     }
     result
