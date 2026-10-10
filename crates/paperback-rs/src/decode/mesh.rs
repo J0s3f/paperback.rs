@@ -9,6 +9,8 @@
 
 use std::collections::VecDeque;
 
+use rayon::prelude::*;
+
 use super::bitmap::Bitmap;
 use super::grid::Grid;
 
@@ -63,6 +65,8 @@ pub(crate) struct Mesh {
     across_middles: Vec<Option<Point>>,
     /// Middle of the line between corner (a, b) and (a, b + 1).
     up_middles: Vec<Option<Point>>,
+    /// Whether the search for each corner may use several threads while the mesh is built.
+    parallel: bool,
 }
 
 /// One block: its four corners, as found or, where a line was too faint, as estimated, and
@@ -202,6 +206,7 @@ impl Mesh {
         rows: usize,
         page_angles: (f64, f64),
         perspective_trust: f64,
+        parallel: bool,
     ) -> Option<Self> {
         let mut mesh = Self {
             perspective_trust,
@@ -215,6 +220,7 @@ impl Mesh {
             found: vec![None; (columns + 1) * (rows + 1)],
             across_middles: vec![None; (columns + 1) * (rows + 1)],
             up_middles: vec![None; (columns + 1) * (rows + 1)],
+            parallel,
         };
         let step = mesh.grid.x_step.min(mesh.grid.y_step);
         let (seed, reference) = mesh.find_seed(bitmap, step)?;
@@ -328,6 +334,7 @@ impl Mesh {
                 step * SEED_RADIUS,
                 self.axes(),
                 step,
+                self.parallel,
             ) else {
                 continue;
             };
@@ -340,7 +347,14 @@ impl Mesh {
 
     fn refine_seed(&mut self, bitmap: &Bitmap, seed: (usize, usize), step: f64) {
         let ideal = self.ideal(seed.0, seed.1);
-        if let Some((point, _)) = refine(bitmap, ideal, step * SEED_RADIUS, self.axes(), step) {
+        if let Some((point, _)) = refine(
+            bitmap,
+            ideal,
+            step * SEED_RADIUS,
+            self.axes(),
+            step,
+            self.parallel,
+        ) {
             self.found[seed.1 * self.across + seed.0] = Some(point);
         }
     }
@@ -369,9 +383,14 @@ impl Mesh {
                 let (line_guess, axes) = self.predict(here, (a, b), (da, db));
                 // Many corners around it say more than the line it was reached along.
                 let guess = self.fitted_corner(na, nb).unwrap_or(line_guess);
-                if let Some((point, score)) =
-                    refine(bitmap, guess, step * FOLLOW_RADIUS, axes, step)
-                    && score >= minimum
+                if let Some((point, score)) = refine(
+                    bitmap,
+                    guess,
+                    step * FOLLOW_RADIUS,
+                    axes,
+                    step,
+                    self.parallel,
+                ) && score >= minimum
                 {
                     self.found[at] = Some(point);
                     scores[at] = score;
@@ -443,9 +462,14 @@ impl Mesh {
                         continue;
                     };
                     let axes = self.axes();
-                    if let Some((point, score)) =
-                        refine(bitmap, guess, step * FOLLOW_RADIUS, axes, step)
-                        && score >= floor
+                    if let Some((point, score)) = refine(
+                        bitmap,
+                        guess,
+                        step * FOLLOW_RADIUS,
+                        axes,
+                        step,
+                        self.parallel,
+                    ) && score >= floor
                     {
                         self.found[at] = Some(point);
                         filled = true;
@@ -640,41 +664,206 @@ fn edge_middle(bitmap: &Bitmap, from: Point, to: Point, step: f64, minimum: f64)
     Some((middle.0 + side.0 * offset, middle.1 + side.1 * offset))
 }
 
+/// A sample taken at a place between pixels: the pixel to its upper left and how far past it
+/// the place lies, for bilinear interpolation.
+#[derive(Clone, Copy)]
+struct Tap {
+    x: isize,
+    y: isize,
+    fx: f64,
+    fy: f64,
+}
+
+impl Tap {
+    fn at((x, y): Point) -> Self {
+        let (x0, y0) = (x.floor(), y.floor());
+        Self {
+            x: x0 as isize,
+            y: y0 as isize,
+            fx: x - x0,
+            fy: y - y0,
+        }
+    }
+}
+
+/// The places along one arm of a cross where a dark line is looked for: the line itself and
+/// the paper on both sides of it, one set per step along the arm. When the cross is moved by
+/// whole pixels the interpolation weights stay the same, so an arm worked out once serves every
+/// place of a search; this takes the cost of working out places and weights out of the search.
+struct Arm {
+    steps: Vec<[Tap; 3]>,
+    /// The extent of the pixels read, to see whether a moved arm stays inside the bitmap.
+    least: (isize, isize),
+    most: (isize, isize),
+}
+
+impl Arm {
+    /// The arm through `point` along `direction`, `side` being across it.
+    fn new(point: Point, direction: Point, side: Point, arm: f64) -> Self {
+        let mut steps = Vec::new();
+        let mut t = -arm;
+        while t <= arm {
+            let on = (point.0 + direction.0 * t, point.1 + direction.1 * t);
+            steps.push([
+                Tap::at(on),
+                Tap::at((on.0 + side.0 * LINE_OFFSET, on.1 + side.1 * LINE_OFFSET)),
+                Tap::at((on.0 - side.0 * LINE_OFFSET, on.1 - side.1 * LINE_OFFSET)),
+            ]);
+            t += 1.0;
+        }
+        let taps = || steps.iter().flatten();
+        let least = (
+            taps().map(|tap| tap.x).min().unwrap_or(0),
+            taps().map(|tap| tap.y).min().unwrap_or(0),
+        );
+        let most = (
+            taps().map(|tap| tap.x).max().unwrap_or(0),
+            taps().map(|tap| tap.y).max().unwrap_or(0),
+        );
+        Self { steps, least, most }
+    }
+
+    /// The contrast of the line when the arm is moved by (`dx`, `dy`) whole pixels: the same
+    /// as [`ridge`] at the moved place. `None` if any sample would be outside the bitmap.
+    fn ridge(&self, bitmap: &Bitmap, dx: isize, dy: isize) -> Option<f64> {
+        let (width, height) = (bitmap.width() as isize, bitmap.height() as isize);
+        if self.least.0 + dx < 0
+            || self.least.1 + dy < 0
+            || self.most.0 + dx + 1 >= width
+            || self.most.1 + dy + 1 >= height
+        {
+            return None;
+        }
+        let read = |tap: &Tap| {
+            let (x, y) = ((tap.x + dx) as usize, (tap.y + dy) as usize);
+            let p = |ox: usize, oy: usize| f64::from(bitmap.at(x + ox, y + oy));
+            let top = p(0, 0) + (p(1, 0) - p(0, 0)) * tap.fx;
+            let bottom = p(0, 1) + (p(1, 1) - p(0, 1)) * tap.fx;
+            top + (bottom - top) * tap.fy
+        };
+        let mut sum = 0.0;
+        for [line, left, right] in &self.steps {
+            sum += f64::midpoint(read(left), read(right)) - read(line);
+        }
+        Some(sum / self.steps.len() as f64)
+    }
+}
+
+/// The two arms of a cross at a place, to be moved over the search window.
+struct Cross {
+    horizontal: Arm,
+    vertical: Arm,
+}
+
+impl Cross {
+    fn new(center: Point, axes: Axes, arm: f64) -> Self {
+        Self {
+            horizontal: Arm::new(center, axes.along_x, axes.along_y, arm),
+            vertical: Arm::new(center, axes.along_y, axes.along_x, arm),
+        }
+    }
+
+    /// How much darker than the paper beside them the lines are when the cross is moved by
+    /// (`dx`, `dy`): the smaller of the contrast of the two arms.
+    fn contrast(&self, bitmap: &Bitmap, dx: isize, dy: isize) -> Option<f64> {
+        let horizontal = self.horizontal.ridge(bitmap, dx, dy)?;
+        let vertical = self.vertical.ridge(bitmap, dx, dy)?;
+        Some(horizontal.min(vertical))
+    }
+}
+
 /// Searches around `center` for the place where a horizontal and a vertical dark line cross.
 /// Returns the place to a fraction of a pixel and the contrast of the lines with the paper.
+/// A place of the search window with the score of the crossing there.
+type Place = (isize, isize, f64);
+
+/// The better of two places: the higher score, and of equal ones the first in the order of rows.
+fn better_place(a: Option<Place>, b: Option<Place>) -> Option<Place> {
+    #[allow(
+        clippy::float_cmp,
+        reason = "equal scores must pick the first point, as the full search does"
+    )]
+    match (a, b) {
+        (None, other) | (other, None) => other,
+        (Some(first), Some(second)) => {
+            if second.2 > first.2
+                || (second.2 == first.2 && (second.1, second.0) < (first.1, first.0))
+            {
+                Some(second)
+            } else {
+                Some(first)
+            }
+        }
+    }
+}
+
+/// Looks at the place (`dx`, `dy`) of the search window and keeps it in `best` if it is better.
+/// The score is the smaller of the two arms, so a place whose horizontal arm is below the best
+/// score so far is dismissed without the vertical one.
+fn consider(best: &mut Option<Place>, cross: &Cross, bitmap: &Bitmap, dx: isize, dy: isize) {
+    let Some(horizontal) = cross.horizontal.ridge(bitmap, dx, dy) else {
+        return;
+    };
+    if best.is_some_and(|(_, _, s)| horizontal < s) {
+        return;
+    }
+    let Some(vertical) = cross.vertical.ridge(bitmap, dx, dy) else {
+        return;
+    };
+    *best = better_place(*best, Some((dx, dy, horizontal.min(vertical))));
+}
+
+/// Windows with at least this many rows are searched on several threads when asked to be.
+const PARALLEL_ROWS: isize = 8;
+
 fn refine(
     bitmap: &Bitmap,
     center: Point,
     radius: f64,
     axes: Axes,
     step: f64,
+    parallel: bool,
 ) -> Option<(Point, f64)> {
     let arm = (step * ARM_SHARE).max(4.0);
     let reach = radius.ceil() as isize;
-    let mut best: Option<(isize, isize, f64)> = None;
-    let mut scores = std::collections::HashMap::new();
-    for dy in -reach..=reach {
+    let cross = Cross::new(center, axes, arm);
+    // The best point is the first of the highest scores in the order of rows. The centre
+    // usually scores well, so starting with it lets most of the others be dismissed after
+    // the horizontal arm alone.
+    let centre: Option<Place> = cross.contrast(bitmap, 0, 0).map(|score| (0, 0, score));
+    let search_row = |dy: isize, mut best: Option<Place>| {
         for dx in -reach..=reach {
-            let point = (center.0 + dx as f64, center.1 + dy as f64);
-            let Some(score) = cross_contrast(bitmap, point, axes, arm) else {
-                continue;
-            };
-            scores.insert((dx, dy), score);
-            if best.is_none_or(|(_, _, s)| score > s) {
-                best = Some((dx, dy, score));
+            if (dx, dy) != (0, 0) {
+                consider(&mut best, &cross, bitmap, dx, dy);
             }
         }
-    }
+        best
+    };
+    // Rows are independent, and the best of the rows is the best of all: the same place either way.
+    let best = if parallel && reach >= PARALLEL_ROWS {
+        (-reach..=reach)
+            .into_par_iter()
+            .map(|dy| search_row(dy, centre))
+            .reduce(|| None, better_place)
+    } else {
+        (-reach..=reach).fold(centre, |best, dy| search_row(dy, best))
+    };
     let (dx, dy, score) = best?;
+    // Scores next to the best one, where they lie within the search.
+    let scores = |dx: isize, dy: isize| {
+        (dx.abs() <= reach && dy.abs() <= reach)
+            .then(|| cross.contrast(bitmap, dx, dy))
+            .flatten()
+    };
     // The top of a parabola through the best score and its two neighbours, per axis.
-    let top = |lower: Option<&f64>, middle: f64, upper: Option<&f64>| match (lower, upper) {
-        (Some(&l), Some(&u)) if 2.0 * middle - l - u > f64::EPSILON => {
+    let top = |lower: Option<f64>, middle: f64, upper: Option<f64>| match (lower, upper) {
+        (Some(l), Some(u)) if 2.0 * middle - l - u > f64::EPSILON => {
             0.5 * (l - u) / (l - 2.0 * middle + u)
         }
         _ => 0.0,
     };
-    let fine_x = top(scores.get(&(dx - 1, dy)), score, scores.get(&(dx + 1, dy)));
-    let fine_y = top(scores.get(&(dx, dy - 1)), score, scores.get(&(dx, dy + 1)));
+    let fine_x = top(scores(dx - 1, dy), score, scores(dx + 1, dy));
+    let fine_y = top(scores(dx, dy - 1), score, scores(dx, dy + 1));
     Some((
         (
             center.0 + dx as f64 + fine_x.clamp(-0.5, 0.5),
@@ -684,16 +873,9 @@ fn refine(
     ))
 }
 
-/// How much darker than the paper beside them the lines through `point` are: the smaller
-/// of the contrast of the horizontal and of the vertical arm. `None` outside the picture.
-fn cross_contrast(bitmap: &Bitmap, point: Point, axes: Axes, arm: f64) -> Option<f64> {
-    let horizontal = ridge(bitmap, point, axes.along_x, axes.along_y, arm)?;
-    let vertical = ridge(bitmap, point, axes.along_y, axes.along_x, arm)?;
-    Some(horizontal.min(vertical))
-}
-
 /// The contrast of a dark line through `point` along `direction` (`side` is across it),
 /// averaged over `arm` pixels on both sides of the point.
+#[cfg_attr(feature = "profile", inline(never))]
 fn ridge(bitmap: &Bitmap, point: Point, direction: Point, side: Point, arm: f64) -> Option<f64> {
     let mut sum = 0.0;
     let mut count = 0.0;
@@ -717,6 +899,7 @@ fn ridge(bitmap: &Bitmap, point: Point, direction: Point, side: Point, arm: f64)
 }
 
 /// The brightness at a point between pixels (bilinear); `None` outside the picture.
+#[cfg_attr(feature = "profile", inline(never))]
 pub(crate) fn sample(bitmap: &Bitmap, (x, y): Point) -> Option<f64> {
     if x < 0.0 || y < 0.0 {
         return None;
@@ -775,7 +958,16 @@ mod tests {
     #[test]
     fn the_corners_of_a_straight_grid_are_found_where_the_lines_cross() {
         let bitmap = grid_picture(420, 420, 60, |x, y| (x - 0.5, y - 0.5));
-        let mesh = Mesh::build(&bitmap, straight_grid(60.0, 60.0), 5, 5, (0.0, 0.0), 0.5).unwrap();
+        let mesh = Mesh::build(
+            &bitmap,
+            straight_grid(60.0, 60.0),
+            5,
+            5,
+            (0.0, 0.0),
+            0.5,
+            false,
+        )
+        .unwrap();
         let quad = mesh.quad(2, 2);
         assert_eq!(quad.corners_found, 4);
         for (found, expected) in [
@@ -794,7 +986,16 @@ mod tests {
             (x - shift, y + 6.0 * (x / 420.0))
         };
         let bitmap = grid_picture(420, 420, 60, bend);
-        let mesh = Mesh::build(&bitmap, straight_grid(60.0, 60.0), 5, 5, (0.0, 0.0), 0.5).unwrap();
+        let mesh = Mesh::build(
+            &bitmap,
+            straight_grid(60.0, 60.0),
+            5,
+            5,
+            (0.0, 0.0),
+            0.5,
+            false,
+        )
+        .unwrap();
         // A corner far from the middle sits where the bent lines cross, not where the straight grid is.
         let far = mesh.quad(4, 4).upper_right;
         let straight = mesh.ideal(5, 5);
@@ -841,6 +1042,7 @@ mod tests {
             found: vec![None; 49],
             across_middles: vec![None; 49],
             up_middles: vec![None; 49],
+            parallel: false,
         };
         for b in 0..7 {
             for a in 0..7 {
@@ -867,6 +1069,7 @@ mod tests {
             found: vec![None; 49],
             across_middles: vec![None; 49],
             up_middles: vec![None; 49],
+            parallel: false,
         };
         mesh.found[2 * 7 + 3] = Some((180.0, 120.0));
         mesh.found[3 * 7 + 2] = Some((120.0, 180.0));
@@ -876,7 +1079,18 @@ mod tests {
     #[test]
     fn a_picture_without_lines_has_no_mesh() {
         let blank = Bitmap::from_raster(&Raster::filled(300, 300, 255));
-        assert!(Mesh::build(&blank, straight_grid(60.0, 30.0), 3, 3, (0.0, 0.0), 0.5).is_none());
+        assert!(
+            Mesh::build(
+                &blank,
+                straight_grid(60.0, 30.0),
+                3,
+                3,
+                (0.0, 0.0),
+                0.5,
+                false
+            )
+            .is_none()
+        );
     }
 
     #[test]

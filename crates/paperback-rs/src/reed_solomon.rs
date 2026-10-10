@@ -14,6 +14,8 @@
 
 use std::sync::OnceLock;
 
+use crate::simd;
+
 pub(crate) const PARITY_LEN: usize = 32;
 pub(crate) const CODEWORD_LEN: usize = 255;
 pub(crate) const MESSAGE_LEN: usize = CODEWORD_LEN - PARITY_LEN;
@@ -33,6 +35,18 @@ const GENERATOR: [u8; PARITY_LEN + 1] = [
 struct Field {
     alpha: [u8; FIELD_ORDER + 1],
     index: [u8; FIELD_ORDER + 1],
+    /// `generator_multiples[f]` is `f` times the low 32 coefficients of the generator
+    /// polynomial, the 32 bytes as four little-endian words (byte `k` is the coefficient of
+    /// `x^k`): what dividing a word by the generator subtracts when `f` falls off the top.
+    generator_multiples: Vec<[u64; 4]>,
+    /// `evaluation[k][n]` holds, byte `i`, `n * root_i^k` for the 16 values `n` of a nibble, and
+    /// `evaluation[k][16 + n]` the same for `n << 4`: with them the remainder of the division
+    /// by the generator is turned into the 32 syndromes by table rows alone.
+    evaluation: Vec<[[u64; 4]; 32]>,
+    /// `locator_power[j][p]` is `alpha^(j * (p + 1))`: the `j`-th term of the error locator
+    /// polynomial at the `p`-th place of the search for its roots. The rows have 256 places, the
+    /// last one unused, so that they are whole vectors.
+    locator_power: Vec<[u8; 256]>,
 }
 
 fn field() -> &'static Field {
@@ -49,13 +63,69 @@ fn field() -> &'static Field {
                 element ^= FIELD_POLYNOMIAL;
             }
         }
-        Field { alpha, index }
+        let times = |a: u8, b: u8| {
+            if a == 0 || b == 0 {
+                0
+            } else {
+                alpha[(index[a as usize] as usize + index[b as usize] as usize) % FIELD_ORDER]
+            }
+        };
+        let roots: Vec<u8> = (0..PARITY_LEN)
+            .map(|i| alpha[((FIRST_ROOT + i) * ROOT_STEP) % FIELD_ORDER])
+            .collect();
+        // The generator polynomial: the product of (x + root) over the roots.
+        let mut generator = vec![1u8];
+        for &root in &roots {
+            let mut next = vec![0u8; generator.len() + 1];
+            for (k, &coefficient) in generator.iter().enumerate() {
+                next[k + 1] ^= coefficient;
+                next[k] ^= times(root, coefficient);
+            }
+            generator = next;
+        }
+        let pack = |bytes: [u8; PARITY_LEN]| -> [u64; 4] {
+            std::array::from_fn(|word| {
+                u64::from_le_bytes(std::array::from_fn(|byte| bytes[word * 8 + byte]))
+            })
+        };
+        let generator_multiples = (0..=u8::MAX)
+            .map(|f| pack(std::array::from_fn(|k| times(f, generator[k]))))
+            .collect();
+        let evaluation = (0..PARITY_LEN)
+            .map(|k| {
+                std::array::from_fn(|entry| {
+                    let n = if entry < 16 { entry } else { (entry - 16) << 4 } as u8;
+                    pack(std::array::from_fn(|i| {
+                        let power = (0..k).fold(1u8, |p, _| times(p, roots[i]));
+                        times(n, power)
+                    }))
+                })
+            })
+            .collect();
+        let locator_power = (0..=PARITY_LEN)
+            .map(|j| {
+                std::array::from_fn(|p| {
+                    if p < FIELD_ORDER {
+                        alpha[(j * (p + 1)) % FIELD_ORDER]
+                    } else {
+                        0
+                    }
+                })
+            })
+            .collect();
+        Field {
+            alpha,
+            index,
+            generator_multiples,
+            evaluation,
+            locator_power,
+        }
     })
 }
 
 /// Computes the parity of the first `MESSAGE_LEN - pad` bytes of `data`.
 pub(crate) fn encode(data: &[u8], pad: usize) -> [u8; PARITY_LEN] {
-    let Field { alpha, index } = field();
+    let Field { alpha, index, .. } = field();
     let mut parity = [0u8; PARITY_LEN];
     for &byte in &data[..MESSAGE_LEN - pad] {
         let feedback = index[(byte ^ parity[0]) as usize] as usize;
@@ -77,8 +147,19 @@ pub(crate) fn encode(data: &[u8], pad: usize) -> [u8; PARITY_LEN] {
 /// Corrects `data` (message followed by parity, `CODEWORD_LEN - pad` bytes) in
 /// place. Returns the number of corrected bytes, or `None` if the block is
 /// beyond repair.
+#[cfg(test)]
 pub(crate) fn decode(data: &mut [u8], pad: usize) -> Option<usize> {
     decode_with_erasures(data, pad, &[])
+}
+
+/// Like [`decode`], but gives up as soon as it is clear that more than `max_corrections` bytes
+/// are wrong. Most blocks that are tried are not blocks at all (the wrong turn of the page, the
+/// wrong threshold), and for those this saves searching for the error positions. Measured, the
+/// early exit fires for under 1% of the words, so the speed comes from the rest of the decoder;
+/// the limit is kept because it is the rule the callers apply anyway. When it gives up (`None`)
+/// `data` is left as it was, whereas [`decode`] has already changed it.
+pub(crate) fn decode_up_to(data: &mut [u8], pad: usize, max_corrections: usize) -> Option<usize> {
+    decode_limited(data, pad, &[], max_corrections)
 }
 
 /// Like [`decode`], for bytes at known positions that are probably damaged (their dots
@@ -94,31 +175,63 @@ pub(crate) fn decode_with_erasures(
     pad: usize,
     erasures: &[usize],
 ) -> Option<usize> {
+    decode_limited(data, pad, erasures, PARITY_LEN)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "a close port of the original routine; splitting it would hide the correspondence"
+)]
+#[cfg_attr(feature = "profile", inline(never))]
+fn decode_limited(
+    data: &mut [u8],
+    pad: usize,
+    erasures: &[usize],
+    max_corrections: usize,
+) -> Option<usize> {
     if erasures.len() > PARITY_LEN || erasures.iter().any(|&at| at >= CODEWORD_LEN - pad) {
         return None;
     }
-    let Field { alpha, index } = field();
+    let Field {
+        alpha,
+        index,
+        generator_multiples,
+        evaluation,
+        locator_power,
+    } = field();
     let log = |value: u8| index[value as usize];
     let exp = |power: usize| alpha[power % FIELD_ORDER];
 
-    let mut syndrome = [0u8; PARITY_LEN];
-    syndrome.fill(data[0]);
-    for &byte in &data[1..CODEWORD_LEN - pad] {
-        for (i, s) in syndrome.iter_mut().enumerate() {
-            *s = if *s == 0 {
-                byte
-            } else {
-                byte ^ exp(log(*s) as usize + (FIRST_ROOT + i) * ROOT_STEP)
-            };
+    // The word divided by the generator polynomial, 32 bytes held in four words: the shift
+    // register of the encoder, run over the received word. Its value at a root is the syndrome of
+    // that root, and it is zero exactly when all syndromes are.
+    let mut remainder = [0u64; 4];
+    for &byte in &data[..CODEWORD_LEN - pad] {
+        let fed_back = &generator_multiples[(remainder[3] >> 56) as usize];
+        remainder = [
+            ((remainder[0] << 8) | u64::from(byte)) ^ fed_back[0],
+            ((remainder[1] << 8) | (remainder[0] >> 56)) ^ fed_back[1],
+            ((remainder[2] << 8) | (remainder[1] >> 56)) ^ fed_back[2],
+            ((remainder[3] << 8) | (remainder[2] >> 56)) ^ fed_back[3],
+        ];
+    }
+    if remainder == [0; 4] {
+        return Some(0);
+    }
+    let mut syndromes = [0u64; 4];
+    for (k, row) in evaluation.iter().enumerate() {
+        let coefficient = (remainder[k / 8] >> (8 * (k % 8))) as u8;
+        for (sum, (low, high)) in syndromes.iter_mut().zip(
+            row[usize::from(coefficient & 0x0F)]
+                .iter()
+                .zip(&row[16 + usize::from(coefficient >> 4)]),
+        ) {
+            *sum ^= low ^ high;
         }
     }
-    let mut syndrome_nonzero = 0u8;
-    for s in &mut syndrome {
-        syndrome_nonzero |= *s;
-        *s = log(*s);
-    }
-    if syndrome_nonzero == 0 {
-        return Some(0);
+    let mut syndrome = [0u8; PARITY_LEN];
+    for (i, s) in syndrome.iter_mut().enumerate() {
+        *s = log((syndromes[i / 8] >> (8 * (i % 8))) as u8);
     }
 
     let mut lambda = [0u8; PARITY_LEN + 1];
@@ -135,50 +248,42 @@ pub(crate) fn decode_with_erasures(
             }
         }
     }
-    let mut b = [0u8; PARITY_LEN + 1];
-    for i in 0..=PARITY_LEN {
-        b[i] = log(lambda[i]);
-    }
-    let mut t = [0u8; PARITY_LEN + 1];
+    // Berlekamp-Massey. The polynomials are kept as they are, not as logarithms, so that its
+    // update is one row times a constant, which the vector code does a whole row at a time.
+    let mut b = lambda;
     let mut el = erasures.len();
     for r in erasures.len() + 1..=PARITY_LEN {
         let mut discrepancy = 0u8;
-        for i in 0..r {
+        // Beyond the highest non-zero coefficient there is nothing to add.
+        let reach = lambda
+            .iter()
+            .rposition(|&l| l != 0)
+            .map_or(0, |top| top + 1);
+        for i in 0..r.min(reach) {
             if lambda[i] != 0 && syndrome[r - i - 1] != ZERO_LOG {
                 discrepancy ^= exp(log(lambda[i]) as usize + syndrome[r - i - 1] as usize);
             }
         }
-        let discrepancy = log(discrepancy);
-        if discrepancy == ZERO_LOG {
+        if discrepancy == 0 {
             b.copy_within(0..PARITY_LEN, 1);
-            b[0] = ZERO_LOG;
+            b[0] = 0;
         } else {
-            t[0] = lambda[0];
-            for i in 0..PARITY_LEN {
-                t[i + 1] = if b[i] == ZERO_LOG {
-                    lambda[i + 1]
-                } else {
-                    lambda[i + 1] ^ exp(discrepancy as usize + b[i] as usize)
-                };
-            }
+            let mut next = lambda;
+            simd::xor_scaled(&mut next[1..], discrepancy, &b[..PARITY_LEN]);
             if 2 * el < r + erasures.len() {
                 el = r + erasures.len() - el;
-                for i in 0..=PARITY_LEN {
-                    b[i] = if lambda[i] == 0 {
-                        ZERO_LOG
-                    } else {
-                        ((log(lambda[i]) as usize + FIELD_ORDER - discrepancy as usize)
-                            % FIELD_ORDER) as u8
-                    };
-                }
+                let inverse = exp(FIELD_ORDER - log(discrepancy) as usize);
+                b = [0; PARITY_LEN + 1];
+                simd::xor_scaled(&mut b, inverse, &lambda);
             } else {
                 b.copy_within(0..PARITY_LEN, 1);
-                b[0] = ZERO_LOG;
+                b[0] = 0;
             }
-            lambda = t;
+            lambda = next;
         }
     }
 
+    let linear_lambda = lambda;
     let mut degree = 0usize;
     for (i, l) in lambda.iter_mut().enumerate() {
         *l = log(*l);
@@ -186,22 +291,23 @@ pub(crate) fn decode_with_erasures(
             degree = i;
         }
     }
+    // More errors than the caller can use: no need to look for where they are.
+    if degree > max_corrections {
+        return None;
+    }
 
-    let mut reg = [0u8; PARITY_LEN + 1];
-    reg[1..].copy_from_slice(&lambda[1..]);
+    // The error locator polynomial at every place of the search at once: its terms are added
+    // up one coefficient after the other, each a fixed row of powers times the coefficient.
+    let mut values = [1u8; 256];
+    for (j, &coefficient) in linear_lambda.iter().enumerate().take(degree + 1).skip(1) {
+        simd::xor_scaled(&mut values, coefficient, &locator_power[j]);
+    }
     let mut roots = [0usize; PARITY_LEN];
     let mut locations = [0usize; PARITY_LEN];
     let mut count = 0usize;
     let mut k = 115usize;
-    for i in 1..=FIELD_ORDER {
-        let mut q = 1u8;
-        for j in (1..=degree).rev() {
-            if reg[j] != ZERO_LOG {
-                reg[j] = ((reg[j] as usize + j) % FIELD_ORDER) as u8;
-                q ^= alpha[reg[j] as usize];
-            }
-        }
-        if q == 0 {
+    for (i, &value) in (1..=FIELD_ORDER).zip(&values) {
+        if value == 0 {
             roots[count] = i;
             locations[count] = k;
             count += 1;
@@ -273,7 +379,7 @@ mod tests {
 
     #[test]
     fn field_tables_match_the_reference_values() {
-        let Field { alpha, index } = field();
+        let Field { alpha, index, .. } = field();
         assert_eq!(
             &alpha[..10],
             &[0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x87, 0x89]
@@ -353,5 +459,314 @@ mod tests {
         }
         let verdict = decode(&mut damaged, PAD);
         assert!(verdict.is_none_or(|n| n <= 16));
+    }
+
+    type Decoder = dyn FnMut(&mut [u8; BLOCK]) -> Option<usize>;
+
+    /// Time per call of the decoder on words that are not codewords, which is what most calls
+    /// are: the page is turned the wrong way or the threshold is wrong. Run with
+    /// `cargo test --release -- --ignored --nocapture decoder_speed`.
+    #[test]
+    #[ignore = "a speed measurement, not a test"]
+    fn decoder_speed() {
+        for level in simd::Level::all_available() {
+            println!("level {}", level.name());
+            simd::tests::with_level(level, measure_decoder);
+        }
+        // The way the program runs: the level found once, the kernel looked up once.
+        println!("in use: {}", simd::level().name());
+        measure_decoder();
+    }
+
+    fn measure_decoder() {
+        use std::time::Instant;
+        const CALLS: usize = 200_000;
+        let mut state = 0x1234_5678_u32;
+        let mut random_word = || -> [u8; BLOCK] {
+            std::array::from_fn(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+        };
+        let words: Vec<[u8; BLOCK]> = (0..64).map(|_| random_word()).collect();
+        let erased: Vec<usize> = (0..24).map(|i| i * 5).collect();
+        let time = |what: &str, mut call: Box<Decoder>| {
+            let start = Instant::now();
+            let mut accepted = 0;
+            for n in 0..CALLS {
+                let mut word = words[n % words.len()];
+                accepted += usize::from(call(&mut word).is_some());
+            }
+            let per_call = start.elapsed().as_secs_f64() * 1e9 / CALLS as f64;
+            println!("{what:<34} {per_call:>8.0} ns per call, {accepted} accepted");
+        };
+        // A codeword has no syndromes to speak of: the cost of the syndromes alone.
+        let message: [u8; BLOCK - PARITY_LEN] = std::array::from_fn(|i| (i * 7 + 3) as u8);
+        let mut valid = [0u8; BLOCK];
+        valid[..message.len()].copy_from_slice(&message);
+        let parity = encode(&valid, PAD);
+        valid[BLOCK - PARITY_LEN..].copy_from_slice(&parity);
+        let start = Instant::now();
+        for _ in 0..CALLS {
+            let mut word = valid;
+            assert_eq!(decode(&mut word, PAD), Some(0));
+        }
+        println!(
+            "{:<34} {:>8.0} ns per call",
+            "a codeword (syndromes only)",
+            start.elapsed().as_secs_f64() * 1e9 / CALLS as f64
+        );
+        time("no erasures, any errors", Box::new(|w| decode(w, PAD)));
+        time(
+            "no erasures, at most 16",
+            Box::new(|w| decode_up_to(w, PAD, 16)),
+        );
+        let e16 = erased[..16].to_vec();
+        time(
+            "16 erasures",
+            Box::new(move |w| decode_with_erasures(w, PAD, &e16)),
+        );
+        time(
+            "24 erasures",
+            Box::new(move |w| decode_with_erasures(w, PAD, &erased)),
+        );
+    }
+
+    /// The decoder as it was before it was made faster: logarithms throughout, one place of the
+    /// root search at a time. Everything faster is compared with it.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "a copy of the original routine, kept as it was"
+    )]
+    fn reference_decode(data: &mut [u8], pad: usize, erasures: &[usize]) -> Option<usize> {
+        if erasures.len() > PARITY_LEN || erasures.iter().any(|&at| at >= CODEWORD_LEN - pad) {
+            return None;
+        }
+        let Field { alpha, index, .. } = field();
+        let log = |value: u8| index[value as usize];
+        let exp = |power: usize| alpha[power % FIELD_ORDER];
+
+        let mut syndrome = [0u8; PARITY_LEN];
+        syndrome.fill(data[0]);
+        for &byte in &data[1..CODEWORD_LEN - pad] {
+            for (i, s) in syndrome.iter_mut().enumerate() {
+                *s = if *s == 0 {
+                    byte
+                } else {
+                    byte ^ exp(log(*s) as usize + (FIRST_ROOT + i) * ROOT_STEP)
+                };
+            }
+        }
+        let mut syndrome_nonzero = 0u8;
+        for s in &mut syndrome {
+            syndrome_nonzero |= *s;
+            *s = log(*s);
+        }
+        if syndrome_nonzero == 0 {
+            return Some(0);
+        }
+
+        let mut lambda = [0u8; PARITY_LEN + 1];
+        lambda[0] = 1;
+        // The erasure locator polynomial is the starting point of the search for the others.
+        if let Some((&first, others)) = erasures.split_first() {
+            lambda[1] = exp(ROOT_STEP * (CODEWORD_LEN - 1 - (first + pad)));
+            for (done, &at) in others.iter().enumerate() {
+                let u = ROOT_STEP * (CODEWORD_LEN - 1 - (at + pad));
+                for j in (1..=done + 2).rev() {
+                    if lambda[j - 1] != 0 {
+                        lambda[j] ^= exp(u + log(lambda[j - 1]) as usize);
+                    }
+                }
+            }
+        }
+        let mut b = [0u8; PARITY_LEN + 1];
+        for i in 0..=PARITY_LEN {
+            b[i] = log(lambda[i]);
+        }
+        let mut t = [0u8; PARITY_LEN + 1];
+        let mut el = erasures.len();
+        for r in erasures.len() + 1..=PARITY_LEN {
+            let mut discrepancy = 0u8;
+            for i in 0..r {
+                if lambda[i] != 0 && syndrome[r - i - 1] != ZERO_LOG {
+                    discrepancy ^= exp(log(lambda[i]) as usize + syndrome[r - i - 1] as usize);
+                }
+            }
+            let discrepancy = log(discrepancy);
+            if discrepancy == ZERO_LOG {
+                b.copy_within(0..PARITY_LEN, 1);
+                b[0] = ZERO_LOG;
+            } else {
+                t[0] = lambda[0];
+                for i in 0..PARITY_LEN {
+                    t[i + 1] = if b[i] == ZERO_LOG {
+                        lambda[i + 1]
+                    } else {
+                        lambda[i + 1] ^ exp(discrepancy as usize + b[i] as usize)
+                    };
+                }
+                if 2 * el < r + erasures.len() {
+                    el = r + erasures.len() - el;
+                    for i in 0..=PARITY_LEN {
+                        b[i] = if lambda[i] == 0 {
+                            ZERO_LOG
+                        } else {
+                            ((log(lambda[i]) as usize + FIELD_ORDER - discrepancy as usize)
+                                % FIELD_ORDER) as u8
+                        };
+                    }
+                } else {
+                    b.copy_within(0..PARITY_LEN, 1);
+                    b[0] = ZERO_LOG;
+                }
+                lambda = t;
+            }
+        }
+
+        let mut degree = 0usize;
+        for (i, l) in lambda.iter_mut().enumerate() {
+            *l = log(*l);
+            if *l != ZERO_LOG {
+                degree = i;
+            }
+        }
+
+        let mut reg = [0u8; PARITY_LEN + 1];
+        reg[1..].copy_from_slice(&lambda[1..]);
+        let mut roots = [0usize; PARITY_LEN];
+        let mut locations = [0usize; PARITY_LEN];
+        let mut count = 0usize;
+        let mut k = 115usize;
+        for i in 1..=FIELD_ORDER {
+            let mut q = 1u8;
+            for j in (1..=degree).rev() {
+                if reg[j] != ZERO_LOG {
+                    reg[j] = ((reg[j] as usize + j) % FIELD_ORDER) as u8;
+                    q ^= alpha[reg[j] as usize];
+                }
+            }
+            if q == 0 {
+                roots[count] = i;
+                locations[count] = k;
+                count += 1;
+                if count == degree {
+                    break;
+                }
+            }
+            k = (k + 116) % FIELD_ORDER;
+        }
+        if degree != count {
+            return None;
+        }
+
+        let omega_degree = degree.saturating_sub(1);
+        let mut omega = [0u8; PARITY_LEN + 1];
+        for i in 0..=omega_degree {
+            let mut sum = 0u8;
+            for j in (0..=i).rev() {
+                if syndrome[i - j] != ZERO_LOG && lambda[j] != ZERO_LOG {
+                    sum ^= exp(syndrome[i - j] as usize + lambda[j] as usize);
+                }
+            }
+            omega[i] = log(sum);
+        }
+        for j in (0..count).rev() {
+            let mut numerator1 = 0u8;
+            for i in (0..=omega_degree).rev() {
+                if omega[i] != ZERO_LOG {
+                    numerator1 ^= exp(omega[i] as usize + i * roots[j]);
+                }
+            }
+            let numerator2 = exp(roots[j] * 111 + FIELD_ORDER);
+            let mut denominator = 0u8;
+            let mut i = (degree.min(31)) & !1usize;
+            loop {
+                if lambda[i + 1] != ZERO_LOG {
+                    denominator ^= exp(lambda[i + 1] as usize + i * roots[j]);
+                }
+                if i < 2 {
+                    break;
+                }
+                i -= 2;
+            }
+            if numerator1 != 0 && locations[j] >= pad {
+                let shift = log(numerator1) as usize + log(numerator2) as usize + FIELD_ORDER
+                    - log(denominator) as usize;
+                data[locations[j] - pad] ^= exp(shift);
+            }
+        }
+        Some(count)
+    }
+
+    fn xorshift(state: &mut u32) -> u32 {
+        *state ^= *state << 13;
+        *state ^= *state >> 17;
+        *state ^= *state << 5;
+        *state
+    }
+
+    /// The erasure counts tried: none, those the reader names (16 and 24), in between, and more
+    /// than the code can repair.
+    const ERASURE_COUNTS: [usize; 6] = [0, 8, 16, 24, 32, 33];
+
+    /// The shortenings tried: the format's, none, and one in between.
+    const PADS: [usize; 3] = [PAD, 0, 60];
+
+    /// A codeword of the shortening `pad` with some bytes changed and some positions named as
+    /// erasures, not in order.
+    fn damaged_word(state: &mut u32, pad: usize) -> (Vec<u8>, Vec<usize>) {
+        let length = CODEWORD_LEN - pad;
+        let mut word = vec![0u8; length];
+        for byte in &mut word[..length - PARITY_LEN] {
+            *byte = xorshift(state) as u8;
+        }
+        let parity = encode(&word, pad);
+        word[length - PARITY_LEN..].copy_from_slice(&parity);
+        let errors = xorshift(state) as usize % 26;
+        for _ in 0..errors {
+            let at = xorshift(state) as usize % length;
+            word[at] ^= (xorshift(state) as u8) | 1;
+        }
+        let erasures = ERASURE_COUNTS[xorshift(state) as usize % ERASURE_COUNTS.len()];
+        let mut named = Vec::new();
+        while named.len() < erasures {
+            let at = xorshift(state) as usize % length;
+            if !named.contains(&at) {
+                named.push(at);
+            }
+        }
+        (word, named)
+    }
+
+    /// Compares the decoder with the original routine on damaged words, at the level in use.
+    fn agrees_with_the_original_routine(words: usize) {
+        let mut state = 0x9E37_79B9;
+        for word_number in 0..words {
+            let pad = PADS[word_number % PADS.len()];
+            let (word, erasures) = damaged_word(&mut state, pad);
+            let (mut new, mut old) = (word.clone(), word.clone());
+            let found = decode_with_erasures(&mut new, pad, &erasures);
+            let expected = reference_decode(&mut old, pad, &erasures);
+            assert_eq!((found, new), (expected, old), "erasures {erasures:?}");
+            // With a limit it does the same, or gives up where the result would be refused.
+            for limit in [0, 8, 16] {
+                let (mut limited, mut original) = (word.clone(), word.clone());
+                let got = decode_limited(&mut limited, pad, &erasures, limit);
+                match reference_decode(&mut original, pad, &erasures) {
+                    Some(count) if count <= limit => {
+                        assert_eq!((got, limited), (Some(count), original));
+                    }
+                    _ => assert_eq!(got, None, "limit {limit}, erasures {erasures:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_faster_decoder_does_what_the_original_routine_does() {
+        for level in simd::Level::all_available() {
+            simd::tests::with_level(level, || agrees_with_the_original_routine(1500));
+        }
     }
 }

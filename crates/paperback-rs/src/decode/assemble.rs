@@ -429,6 +429,12 @@ impl Backup {
             if let Some(plain) = attempt(&|data| codec::decrypt(data, password, &salt_and_iv))? {
                 plain
             } else {
+                // Pages with records come from this program, never from PaperBack 1.00: trying its
+                // scheme as well would only give a wrong password one more chance in 65536 of passing
+                // the 16-bit checksum and handing back garbage.
+                if self.label.mode.is_extended() {
+                    return Err(Error::WrongPassword);
+                }
                 // Pages from PaperBack 1.00 carry no salt; the name field is plain text.
                 let plain = attempt(&|data| codec::decrypt_legacy(data, password))?
                     .ok_or(Error::WrongPassword)?;

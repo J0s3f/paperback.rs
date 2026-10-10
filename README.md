@@ -197,6 +197,17 @@ and 1.10 programs, which run in CI without the original executables, and `tools/
 that drive the original programs through their file dialogs to check both directions on demand (they never
 print or scan).
 
+## Speed on newer processors
+
+Blocks that do not read at once are tried in several ways side by side, and the next ones are read ahead, on all the threads of
+the processor; the blocks read are the same as with one thread. `decode --threads N` sets the number (1 is one after the other;
+the default, 0, uses them all). It speeds up the pictures that need much work: crumpled pages and photographs.
+
+The error correction runs on the vector units of the processor when it has them: SSSE3, AVX2, or GFNI with AVX2 on x86-64, NEON on aarch64,
+chosen when the program starts, or NEON on ARM (Linux, macOS on Apple silicon); a processor with none of them runs the plain code, which gives the same result. `decode -v`
+says which is used. To compare, `PAPERBACK_SIMD=scalar` (or `ssse3`, `avx2`, `gfni`) asks for a lower level; a level the
+processor lacks is never used.
+
 ## Extras that the original does not have
 
 Pages written by paperback.rs carry a SHA-256 of the file and an identifier and layout for each sheet. The originals

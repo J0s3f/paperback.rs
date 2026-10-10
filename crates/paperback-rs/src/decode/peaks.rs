@@ -20,6 +20,7 @@ pub(crate) struct GridFit {
 
 /// Given an intensity profile, finds the dark peaks and fits an arithmetic
 /// sequence through them. Returns `None` when no grid is recognisable.
+#[cfg_attr(feature = "profile", inline(never))]
 pub(crate) fn find_peaks(profile: &[i32]) -> Option<GridFit> {
     let n = profile.len().min(MAX_PROFILE);
     if n < MIN_PROFILE {

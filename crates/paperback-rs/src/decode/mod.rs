@@ -31,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use assemble::{Assembler, ScannedBlock, ScannedPage};
 use bitmap::Bitmap;
 use known::{KnownBlocks, Placement};
-use reader::{BlockOutcome, BlockReader, Effort};
+use reader::{BlockOutcome, BlockReader, Effort, Speculation};
 use sheet::{BlockKey, LatticeRead, Relation, Sheets, corner_cells, sample_cells};
 
 use crate::block::{BLOCK_DOTS, BlockKind, MAX_FILE_SIZE, RawBlock, SuperBlock};
@@ -56,6 +56,7 @@ fn reduction_factor(grid: &grid::Grid) -> usize {
 struct Wanted {
     quality: bool,
     diagnose: bool,
+    threads: usize,
 }
 
 /// Parts of a picture, as shares of its width and height, on which the grid is fitted when
@@ -122,6 +123,7 @@ fn scan_bitmap(raster: &Raster, reading: &Reading, reduced_by: usize) -> Result<
         return Ok(page);
     }
     let mut reader = BlockReader::new(&bitmap, grid, intensity);
+    reader.set_threads(wanted.threads);
     reader.tune_sharpness(TUNING_COLUMNS, TUNING_ROWS);
     if !reader.finds_blocks(PROBE_COLUMNS, PROBE_ROWS) {
         return Err(Error::Decode("no readable blocks found in the grid".into()));
@@ -458,14 +460,19 @@ fn read_skipped_neighbours(
     outcomes: &mut [BlockOutcome],
     (column, row): (usize, usize),
     (columns, rows): (usize, usize),
-) {
+) -> Vec<usize> {
+    let mut read = Vec::new();
     for r in row.saturating_sub(1)..=(row + 1).min(rows - 1) {
         for c in column.saturating_sub(1)..=(column + 1).min(columns - 1) {
             if matches!(outcomes[r * columns + c], BlockOutcome::Skipped) {
                 outcomes[r * columns + c] = reader.read(c, r);
+                if matches!(outcomes[r * columns + c], BlockOutcome::Readable { .. }) {
+                    read.push(r * columns + c);
+                }
             }
         }
     }
+    read
 }
 
 /// Blocks read in order to teach the detector what dots look like on this page, when too few
@@ -487,46 +494,207 @@ fn train_detector(reader: &mut BlockReader, outcomes: &mut [BlockOutcome], colum
     }
 }
 
-/// Rereads the blocks that are still missing, at the effort the reader is set to and at
-/// the positions their readable neighbours show; blocks that were read are left alone.
+/// Whether the block (`column`, `row`) is to be tried again now, and with how many readable
+/// neighbours it was last tried if so.
+fn retry_with(
+    reader: &mut BlockReader,
+    outcomes: &[BlockOutcome],
+    tried_with: &[usize],
+    (columns, rows): (usize, usize),
+    at: usize,
+) -> Option<usize> {
+    let (column, row) = (at % columns, at / columns);
+    let worth_retrying = match outcomes[at] {
+        BlockOutcome::Readable { .. } | BlockOutcome::Skipped => false,
+        BlockOutcome::Unreadable => true,
+        BlockOutcome::Missing => {
+            reader.has_neighbour_to_learn_from(column, row) || reader.mesh_covers(column, row)
+        }
+    };
+    if !worth_retrying {
+        return None;
+    }
+    let readable_around = readable_neighbours(outcomes, (column, row), (columns, rows));
+    (tried_with[at] != readable_around).then_some(readable_around)
+}
+
+/// Whether the cells `a` and `b` (indices) are the same or neighbours.
+fn next_to(a: usize, b: usize, columns: usize) -> bool {
+    (a % columns).abs_diff(b % columns) <= 1 && (a / columns).abs_diff(b / columns) <= 1
+}
+
+/// Whether a block around (`column`, `row`) was skipped as known: reading it is part of
+/// reading this one.
+fn has_skipped_neighbour(
+    outcomes: &[BlockOutcome],
+    (column, row): (usize, usize),
+    (columns, rows): (usize, usize),
+) -> bool {
+    (row.saturating_sub(1)..=(row + 1).min(rows - 1)).any(|r| {
+        (column.saturating_sub(1)..=(column + 1).min(columns - 1))
+            .any(|c| matches!(outcomes[r * columns + c], BlockOutcome::Skipped))
+    })
+}
+
+/// What a walk over the missing blocks knows about the readings made side by side so far.
+struct Walk<'a> {
+    /// Readings made and not used yet, each with how many blocks had been read in the walk when
+    /// it was made.
+    readings: HashMap<usize, (Speculation<'a>, usize)>,
+    /// The blocks read in the walk, in order.
+    read: Vec<usize>,
+    /// How many blocks had been read when what every block starts from last changed.
+    changed_at: usize,
+    /// What every block starts from, as it was then.
+    start: (Option<usize>, usize, usize),
+}
+
+impl<'a> Walk<'a> {
+    fn new(reader: &BlockReader<'a>) -> Self {
+        Self {
+            readings: HashMap::new(),
+            read: Vec::new(),
+            changed_at: 0,
+            start: reader.global_state(),
+        }
+    }
+
+    /// Notes that the block `at` was read.
+    fn note_read(&mut self, reader: &BlockReader<'a>, at: usize) {
+        self.read.push(at);
+        let now = reader.global_state();
+        if now != self.start {
+            self.start = now;
+            self.changed_at = self.read.len();
+        }
+    }
+
+    /// The blocks among `at` whose reading is missing or does not stand any more: a reading
+    /// stands if none of the blocks read since it was made is next to its block or changed what
+    /// every block starts from.
+    fn to_read(&self, cells: &[usize], columns: usize) -> Vec<usize> {
+        cells
+            .iter()
+            .copied()
+            .filter(|at| {
+                !self.readings.get(at).is_some_and(|&(_, version)| {
+                    self.changed_at <= version
+                        && !self.read[version..]
+                            .iter()
+                            .any(|&done| next_to(done, *at, columns))
+                })
+            })
+            .collect()
+    }
+}
+
+/// Goes over the blocks that are missing again and again, row by row, while that finds more.
+/// A block is tried again only if more of its neighbours have been read since it was tried.
+///
+/// With several threads the next blocks to try are read side by side. What that gives is what
+/// trying them one after the other gives: a reading is used only if no block read since it was
+/// made is next to its block or changed what every block starts from (the orientation of the
+/// page, the model of the dots); otherwise it is made again. After a block reads, the walk goes on
+/// with the block after it, so that what the new block makes worth trying is seen at once.
 fn follow_bent_paper(
     reader: &mut BlockReader,
     outcomes: &mut [BlockOutcome],
     columns: usize,
     rows: usize,
 ) {
+    let size = (columns, rows);
     // What a block's neighbours told when it was last tried; trying again is of use only when
     // more neighbours have been read since.
     let mut tried_with = vec![usize::MAX; outcomes.len()];
+    if outcomes
+        .iter()
+        .any(|o| matches!(o, BlockOutcome::Missing | BlockOutcome::Unreadable))
+    {
+        reader.prepare_meshes();
+    }
+    let mut walk = Walk::new(reader);
     for _ in 0..FOLLOW_ROUNDS {
         let mut improved = false;
-        for row in 0..rows {
-            for column in 0..columns {
-                let at = row * columns + column;
-                let worth_retrying = match outcomes[at] {
-                    BlockOutcome::Readable { .. } | BlockOutcome::Skipped => false,
-                    BlockOutcome::Unreadable => true,
-                    BlockOutcome::Missing => {
-                        reader.has_neighbour_to_learn_from(column, row)
-                            || reader.mesh_covers(column, row)
+        let mut next = 0;
+        while next < outcomes.len() {
+            let width = reader.batch_width();
+            // The blocks the walk would try next, as long as none of them has to be read with
+            // the help of a block that is read first.
+            let mut batch: Vec<(usize, usize)> = Vec::new();
+            let mut scan = next;
+            while scan < outcomes.len() && batch.len() < width {
+                if let Some(around) = retry_with(reader, outcomes, &tried_with, size, scan) {
+                    let alone =
+                        has_skipped_neighbour(outcomes, (scan % columns, scan / columns), size);
+                    if alone && !batch.is_empty() {
+                        break;
                     }
-                };
-                if !worth_retrying {
-                    continue;
+                    batch.push((scan, around));
+                    scan += 1;
+                    if alone {
+                        break;
+                    }
+                } else {
+                    scan += 1;
                 }
-                let readable_around = readable_neighbours(outcomes, (column, row), (columns, rows));
-                if tried_with[at] == readable_around {
-                    continue;
-                }
-                tried_with[at] = readable_around;
+            }
+            next = scan;
+            if batch.is_empty() {
+                continue;
+            }
+            if width == 1
+                || has_skipped_neighbour(
+                    outcomes,
+                    (batch[0].0 % columns, batch[0].0 / columns),
+                    size,
+                ) && batch.len() == 1
+            {
+                let (at, around) = batch[0];
+                let (column, row) = (at % columns, at / columns);
+                tried_with[at] = around;
                 // The neighbours' positions and rotations guide the retry: those that were not
                 // read in this reading, because a block was read there before, are read now.
-                read_skipped_neighbours(reader, outcomes, (column, row), (columns, rows));
+                for read in read_skipped_neighbours(reader, outcomes, (column, row), size) {
+                    walk.note_read(reader, read);
+                }
                 let retry = reader.read(column, row);
                 if matches!(retry, BlockOutcome::Readable { .. }) {
                     improved = true;
                     outcomes[at] = retry;
+                    walk.note_read(reader, at);
                 }
+                continue;
+            }
+            // Readings of these blocks that do not stand any more are made again, side by side.
+            let cells_of: Vec<usize> = batch.iter().map(|&(at, _)| at).collect();
+            let to_read = walk.to_read(&cells_of, columns);
+            if !to_read.is_empty() {
+                let cells: Vec<(usize, usize)> = to_read
+                    .iter()
+                    .map(|&at| (at % columns, at / columns))
+                    .collect();
+                let version = walk.read.len();
+                // Cells after one that read were left out; the walk stops at that one.
+                for (&at, reading) in to_read.iter().zip(reader.read_side_by_side(&cells)) {
+                    if let Some(reading) = reading {
+                        walk.readings.insert(at, (reading, version));
+                    }
+                }
+            }
+            for &(at, around) in &batch {
+                let Some((reading, _)) = walk.readings.remove(&at) else {
+                    continue;
+                };
+                tried_with[at] = around;
+                if matches!(reading.outcome, BlockOutcome::Readable { .. }) {
+                    outcomes[at] = reader.accept(reading, at % columns, at / columns);
+                    improved = true;
+                    walk.note_read(reader, at);
+                    // The walk goes on after this block, looking at what it changes.
+                    next = at + 1;
+                    break;
+                }
+                reader.note_failures(&reading);
             }
         }
         if !improved {
@@ -715,6 +883,9 @@ pub struct DecodeOptions {
     /// had it stripped) are accepted, which is how pages of the original programs read. Needed to
     /// notice that someone removed the hash from encrypted pages and changed them.
     pub require_hash: bool,
+    /// Threads to try ways of reading a block on: 0 is as many as the processor has, 1 is
+    /// one after the other. The blocks read are the same either way.
+    pub threads: usize,
 }
 
 /// Decodes the given pages (in any order) into the original file. Unreadable
@@ -742,6 +913,7 @@ pub fn decode(
             Wanted {
                 quality: options.quality,
                 diagnose: options.diagnose,
+                threads: options.threads,
             },
             &sheets,
         ) {

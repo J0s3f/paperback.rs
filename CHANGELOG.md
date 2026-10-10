@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.2
+
+- Several threads: blocks that do not read at once are tried in several ways side by side, and the next missing blocks are read ahead;
+  the blocks read are the same as with one thread. `decode --threads N` (library: `DecodeOptions::threads`), default all threads. The eight
+  hardest test pictures take half the time.
+- Speed: the error correction on the vector units of the processor (SSSE3, AVX2, GFNI, NEON, chosen when the program starts), faster
+  cutting out and reading of blocks, caches of what failed; the same blocks are read. The eight hardest test pictures took 450 seconds and
+  take 82 with 16 threads (166 with one).
+- Fix: pages with extension records are no longer tried with the 1.00 decryption, which with a wrong password passed the check about
+  once in 65536 times and gave garbage.
+
 ## 1.2.1
 
 - `decode --require-hash` (library: `DecodeOptions::require_hash`) fails unless the pages carry a hash or keyed check value

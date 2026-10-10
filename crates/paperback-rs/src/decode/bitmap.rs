@@ -46,6 +46,11 @@ impl Bitmap {
         self.height
     }
 
+    /// All pixels, row after row, `width` to a row.
+    pub(crate) fn pixels(&self) -> &[u8] {
+        &self.pixels
+    }
+
     /// Pixel at column `x` of memory row `y`; callers keep within bounds.
     pub(crate) fn at(&self, x: usize, y: usize) -> u8 {
         self.pixels[y * self.width + x]

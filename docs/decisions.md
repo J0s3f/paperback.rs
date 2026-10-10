@@ -70,7 +70,9 @@ filters are listed under "PDF image filters" below.
 1.00 used AES-256-ECB keyed with the zero-padded password, which leaks structure and has a tiny
 effective key space. Decryption is kept so old backups remain recoverable; it is never written. The
 decoder tries the 1.10 scheme first and falls back to 1.00; the CRC of the plain data tells which
-one is right, so a wrong password fails both.
+one is right, so a wrong password fails both. Pages that carry extension records (mode bit `0x04`) are 1.10 pages only, so
+the 1.00 scheme is not tried on them: with a wrong password its garbage would pass the 16-bit CRC once in 65536 times. For the
+same reason a wrong password can end as a hash mismatch (exit 3) instead of a wrong password (exit 4) in that rare case.
 
 ## Passwords are bytes in the Windows ANSI code page
 
@@ -318,3 +320,159 @@ wrong password are always caught when the value is on the pages. It cannot defen
 the record, the mode bit and the label are not themselves authenticated, so a changed page set with the value taken off
 reads as a page set of the original programs. `decode --require-hash` closes that: it refuses a file without a matching
 value. It is an option because pages of the original programs, and pages made with `--no-extensions`, have none.
+
+## Where the decoding time goes, and what was done about it
+
+Decoding a difficult photograph takes minutes because the decoder tries many things for every block that does not read.
+To see where the time goes there are two tools: `tools/profile.ps1` samples the program with the Windows Performance
+Toolkit (administrator rights; `--features profile` stops the compiler from inlining the functions the report has to tell
+apart), and `tools/timing.sh` decodes a fixed set of eight difficult pictures one after the other and prints the seconds
+and the blocks restored, which is also the check that a change did not change what is read. A sampling profile of the first
+state (eight pictures, 480 s of CPU) said:
+
+| Where | Share |
+|---|---|
+| corner search of the mesh (`mesh::refine`, bilinear sampling along the arms of a cross) | 29% |
+| Reed-Solomon decoding (`decode_with_erasures`) | 28% |
+| cutting out, sharpening and reading dots of a block (`read_posed`) | 25% |
+| choosing thresholds and orientations (`recognise`) | 6% |
+
+Changes that give the same blocks on every picture of the set (eight pictures, seconds):
+
+| Step | Seconds |
+|---|---|
+| start (version 1.2.1) | 450 |
+| corner search: start with the centre and drop a place after its horizontal arm when it cannot win, no table of all scores; syndromes by table; stop when the locator polynomial has more roots than can be used; shifted samplings only for blocks that do not read from the first one; neighbour correction once per variant | 342 |
+| cut a block out once for all sharpness levels (it was cut for each level); sharpening without a branch per pixel; roots of the locator polynomial by table rows; syndrome loop bounded by the locator's degree | 250 |
+| corner search: places and interpolation weights of the arms worked out once per search (moving a cross by whole pixels keeps the weights); skip words that failed already | 212 |
+
+Tried and dropped: a small search window first for the corners (it was about 10% faster but changed what was read, up
+on some pictures and down on `bent20`, below its guard); the order of the results of the corner search is kept exactly,
+including ties.
+
+### Vector code for the error correction
+
+`simd.rs` is the only module with `unsafe` code (the workspace lint is `deny`, the module allows it, and every block says why
+it is sound; `undocumented_unsafe_blocks` is denied). It multiplies rows of bytes in GF(256) with the field polynomial of the
+format (`dst ^= constant * src`) in five ways that give the same bytes: plain table lookups; `pshufb` with two 16-entry nibble
+tables (SSSE3, 16 bytes at a time; AVX2, 32 bytes); `gf2p8affineqb` with the 8 x 8 bit matrix of the constant (GFNI with
+AVX2), which takes any field polynomial, unlike `gf2p8mulb`, which is fixed to the one of AES; and, on ARM (aarch64), the same
+nibble tables with `vqtbl1q_u8` (NEON, which every aarch64 processor has). The level is the best the processor
+offers at the first use, found with `is_x86_feature_detected!`, and the kernel for it is stored once in a function pointer, so a
+multiplication costs an indirect jump and no check of the processor. A vector kernel is handed out only after its feature was
+seen, which is what makes the safe wrappers around the `unsafe` functions sound. `PAPERBACK_SIMD` asks for a lower level;
+`decode -v` prints the one in use. Processors on which the cores differ (big.LITTLE) are fine as long as the instruction set the
+program sees is the same on all cores, which is so for the Intel hybrid processors (AVX-512, where they differ, is not used) and
+for ARM under Linux (it reports the common set); this was reasoned, not tried on such hardware. NEON is tested on the ARM runners
+of the continuous integration (Linux and Apple silicon).
+
+The Reed-Solomon decoder was rebuilt around it (`reed_solomon.rs`), and the original routine is kept in the tests as the
+oracle: random words with errors and erasures are decoded by both, at every level the processor has, and must agree on the result
+and on the corrected bytes.
+
+- The syndromes come from the remainder of the word divided by the generator polynomial (the shift register of the encoder, with
+  a table of multiples of the generator, on four 64-bit words), evaluated at the roots with table rows chosen by its bytes. This
+  needs no vector instructions and runs for every processor: 1.8 microseconds became 0.3.
+- Berlekamp-Massey keeps its polynomials as they are, not as logarithms, so that the update is one multiplication of a row by a
+  constant; the search for the roots of the locator polynomial adds up rows of powers times its coefficients.
+- A call on a word that is not a codeword (`cargo test --release -- --ignored --nocapture decoder_speed`): 5.4 microseconds
+  before, 4.1 plain, 2.2 with SSSE3, 2.0 with AVX2. GFNI was tried on a second machine (AMD EPYC Genoa, which has it): the
+  whole test suite passes with GFNI in use, and the same
+  call took 4.8 microseconds plain, 2.8 with SSSE3, 2.6 with AVX2 and 2.6 with GFNI. So GFNI gives the same bytes but, on this
+  processor, no measurable speed over AVX2.
+  On the first machine, which lacks GFNI, the kernel is tested against a software model of the instruction (the bit matrices
+  multiply as claimed for every constant). `cargo test -p paperback-rs --release --lib simd -- --nocapture` shows which levels
+  were tried.
+- Eight pictures, seconds: 212 before this step, 176 with AVX2, 197 with the plain code, 450 at the start of the speed work, all with
+  the same blocks read.
+
+What is left that vectors could do: the rest of the time is the corner search (bilinear samples; a different method would be
+needed to vectorise it, which would change what is read), cutting out blocks and sharpening (plain loops the compiler vectorises
+when the build is allowed AVX2: about 8% in an experiment, which the run-time choice cannot give them), and the discrepancy
+step of Berlekamp-Massey (a dot product of two vectors, which would want `gf2p8mulb` and a change of basis to the field of AES).
+
+### Further steps after the vector code
+
+Profile after the vector code (eight pictures, 195 s of CPU): cutting a block out of the page 18%, the corner search 21%,
+turning gray levels into bits 10.5%, Reed-Solomon 13%, sharpening 7%, averaging the dots 8%. Changes with the same blocks on
+every picture:
+
+- cutting out: the rise of each column, the pixel index and the row of the bitmap are worked out once instead of for every
+  pixel; averaging a dot needs no check of its pixels when it lies well inside the buffer; the neighbour correction runs over
+  rows with a white border added, without a test for the edge;
+- turning gray levels into bits: the sums behind the limits are made once per variant, the orientations are looked up in
+  tables instead of computed per dot, and how sure each byte is (needed only by the repair of the first reading) is worked
+  out only then.
+
+Eight pictures, seconds: 176 before, 167 after the cutting out, 162 after the bits. Tried and dropped: a 64 KB multiplication
+table for the discrepancy of Berlekamp-Massey (2.2 microseconds per call against 2.05 with logarithms: the table costs more in
+cache misses than it saves in lookups).
+
+What is left is mostly the corner search and the blocks themselves, and one thing they share: everything runs on one thread.
+The reads of the cells of a page are independent in principle, but the reader learns as it goes (the orientation, the variant that
+worked last, the shifts of the neighbours that later reads start from), so reading them in parallel would change which variant
+succeeds first in marginal cases and with it the blocks read; the search windows of the corner search are independent and could
+be spread over threads with the same results.
+
+### Caches of what failed
+
+Counting showed how much of the work repeats: about half of the words handed to the Reed-Solomon decoder had been tried before
+(13 to 18% within one reading of a block, a third more from other cuts of the same block), and about a quarter of the sampled
+grids that reach the threshold reading at the normal or deep effort were identical to a grid that had failed already. Cuts of a
+block that is read again and again, with shifts of a fraction of a pixel, come out the same. The reader now keeps a 64-bit
+fingerprint of each grid that no variant could read and of each word that did not decode, and skips what it has seen fail. This
+is exact: the threshold reading is a function of the grid and the effort (at the quick effort the variants tried depend on the one
+that worked last, so grids are remembered only at the normal and deep effort, apart from each other), and decoding is a function
+of the word. The fingerprint is not made to resist someone who wants two grids to collide, which would at most make the reader
+skip a block that another attempt reads. About 6% faster on `bent20.png` (25.7, 27.1 and 26.0 seconds before; 24.5, 25.4 and 24.3
+after), the same blocks on every picture of the set. Whole cut-outs repeat much less (10 to 19%) and only at one effort level, so
+skipping them was not done.
+
+### Threads
+
+The reader tries a block that does not read where the grid says in up to sixteen other ways: through the corners of each of
+three meshes, and at the shift and rotation of its neighbours. Those ways do not depend on each other, and neither do the
+three meshes, so they can run side by side. What to run them on was decided by a measurement (`tools/exec-bench`, not part of
+the workspace; Windows, 16 threads; batches of 16 CPU-bound tasks of 20 to 240 microseconds, one batch after the other):
+
+| | uneven batch (1 to 12 units) | even batch (16 x 4 units) | 4 tiny tasks |
+|---|---|---|---|
+| sequential | 1.0x | 1.0x | 1.0x |
+| rayon (`scope`, `par_iter`) | 3.3 to 3.6x | 6.0 to 6.4x | 1.3 to 1.5x |
+| tokio (`spawn_blocking`) | 3.5x | 7.0x | 1.9 to 2.2x |
+| smol (`unblock`) | 3.5x | 7.1x | 2.0x |
+| `std::thread::scope` (a thread per task) | 1.2x | 1.5x | 0.3x |
+| greenie | does not build here (its build script compiles assembly for the GNU toolchain; `lib.exe` refuses it), and its fibers are cooperative on one thread, so they can use only one core anyway | | |
+
+The three pools are within 15% of each other at the sizes the decoder has (a read of a block takes 25 milliseconds), so the choice
+rests on fit: tokio and smol run only closures that own their data (`'static`), so the decoder, which borrows the picture,
+would have to be rebuilt around `Arc`; they bring an async runtime and its dependencies into a library that has none; and the
+work is not asynchronous at all. **Rayon** runs closures that borrow, is one small dependency, and its pools can be sized for
+`--threads`. It is used.
+
+How the result stays the same: a way of reading is a function of the block and of the state of the reader (the shifts and
+rotations of the blocks read, the orientation, the variant that read last, the model of the dots). A *copy* of the reader tries
+each way, and the copy of the first way that reads, in the order the sequential code tries them, is taken over: its record of
+where the block sat, and what the dot model should learn, which is replayed in the order the blocks were read. Failures leave
+nothing behind but which grids and words to skip. Across blocks, the walk over the missing blocks reads the next ones side by
+side as well, and keeps the reading of a block only if no block read since it was made is next to it (the shifts and rotations
+of the 3 x 3 around a block are what it starts from) and nothing changed that every block starts from; otherwise it is made
+again. After a block reads the walk goes on with the next block, so that what the new block makes worth trying is seen at once.
+`tests/threads.rs` reads pictures with 1, 3 and as many threads as there are, and `bent20.png` with 16, and requires the same
+blocks, all statistics and file (and that something was read).
+Two errors were found on the way, and are worth knowing: the variant that read last is part of what every block starts from
+(leaving it out gave one block less on `bent20.png` with 16 threads), and a copy that passes on what a copy of it learned must
+not learn it into its own model.
+
+A way is not started once an earlier one has read, and cells after one that has read are not read ahead; what is already running
+is finished. All of it runs on the pool of the reader (one pool per thread count asked for, kept for the life of the program, at
+most 256 threads), including the building of the meshes, so `--threads` holds. Building all three meshes together is a trade:
+on a page that would need one it spends the other two on threads that would be idle.
+
+Result, eight pictures, seconds: 166 with one thread (`--threads 1`), 82 with 16 threads (the same machine, runs differ by a few
+percent between builds, which is why other figures in this file are not exactly these), the same blocks read on every picture;
+the largest picture (125814) 67 to 32. It costs processor time: reading `bent20.png` takes 24 seconds of processor time on
+one thread and 106 on 16, 10 seconds on the clock, because blocks are read ahead and thrown away when an earlier block changes
+what they start from, and the three meshes are built together at the start of each pass instead of when first needed. The first
+look at a picture (finding the grid, the quick pass over every block) is still on one thread, about 0.4 seconds per try.
+`--threads N` (library: `DecodeOptions::threads`) sets the number; 0, the default, is as many as the processor has.

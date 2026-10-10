@@ -49,6 +49,7 @@ mod plan;
 pub mod quality;
 pub mod raster;
 mod reed_solomon;
+pub mod simd;
 
 pub use error::{Error, Result};
 pub use pbx::{Integrity, SheetId};

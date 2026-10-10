@@ -145,6 +145,11 @@ pub(crate) struct DecodeArgs {
     #[arg(long, value_name = "PNG")]
     pub(crate) quality_overlay: Option<String>,
 
+    /// Threads for reading a block that does not read at once: 0 is as many as the processor has,
+    /// 1 is one after the other; more than 256 count as 256. The same blocks are read either way.
+    #[arg(long, default_value_t = 0, value_name = "N")]
+    pub(crate) threads: usize,
+
     /// Fail unless the pages carry a hash (or, for encrypted files, a keyed check value) that the
     /// restored file matches. Pages from PaperBack 1.00 and 1.10 and from `--no-extensions` have
     /// none. Without this, someone who can change the pages can also take the hash off them.

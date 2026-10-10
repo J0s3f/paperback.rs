@@ -36,6 +36,8 @@ pub(crate) struct DotDetector {
     blocks: usize,
     next_fit: usize,
     weights: Option<[f64; FEATURES]>,
+    /// How many times the weights were fitted: what a score depends on changes only then.
+    fits: usize,
 }
 
 impl DotDetector {
@@ -46,7 +48,13 @@ impl DotDetector {
             blocks: 0,
             next_fit: MIN_BLOCKS,
             weights: None,
+            fits: 0,
         }
+    }
+
+    /// How many times the model was fitted; the scores of a grid are the same until it grows.
+    pub(crate) fn fits(&self) -> usize {
+        self.fits
     }
 
     /// Whether enough blocks were seen to judge dots.
@@ -115,6 +123,7 @@ impl DotDetector {
             })
             .collect();
         self.weights = solve(&mut matrix);
+        self.fits += 1;
     }
 }
 

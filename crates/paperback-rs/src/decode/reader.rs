@@ -5,11 +5,18 @@
 //! Reads blocks out of a located grid: resampling, sharpening, dot sampling
 //! and error correction.
 
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use rayon::prelude::*;
+
 use super::bitmap::Bitmap;
 use super::detector::DotDetector;
 use super::grid::{Grid, Intensity};
 use super::mesh::{Mesh, Quad, sample};
 use super::peaks::find_peaks;
+
 use crate::block::{BLOCK_DOTS, BLOCK_LEN, RawBlock, row_mask};
 use crate::crc::crc16;
 
@@ -86,11 +93,69 @@ pub(crate) enum Effort {
 }
 
 /// The corner mesh of a page, which is only built if a block cannot be read otherwise.
+#[derive(Clone)]
 enum MeshState {
     NotBuilt,
     /// There are no grid lines to follow.
     Missing,
-    Built(Mesh),
+    /// Shared, because a copy of the reader that tries one way of reading a block has the meshes
+    /// of the others.
+    Built(Arc<Mesh>),
+}
+
+/// One of the ways to read a block that did not read where the grid says it is.
+enum Way {
+    /// Through the corners of the mesh of this setting.
+    Warped(usize),
+    /// Cut out at a shifted place and turned a little.
+    Posed {
+        shift: (f64, f64),
+        tilt: f64,
+        every_level: bool,
+    },
+}
+
+/// A block read on another thread, from the state the reader had before it.
+pub(crate) struct Speculation<'a> {
+    pub(crate) outcome: BlockOutcome,
+    worker: BlockReader<'a>,
+}
+
+/// What a way of reading gave.
+enum Tried {
+    Warped(Option<(RawBlock, usize)>),
+    Posed(BlockOutcome),
+}
+
+impl Tried {
+    fn read(&self) -> bool {
+        match self {
+            Tried::Warped(found) => found.is_some(),
+            Tried::Posed(outcome) => matches!(outcome, BlockOutcome::Readable { .. }),
+        }
+    }
+}
+
+/// The most threads a pool is made with, whatever is asked for: each size asked for keeps its
+/// pool for the life of the program.
+const MOST_THREADS: usize = 256;
+
+/// Thread pools of the sizes asked for, made when first needed and kept for the life of the
+/// program; `None` for a size that could not be made.
+fn pool_of(threads: usize) -> Option<&'static rayon::ThreadPool> {
+    static POOLS: Mutex<Vec<(usize, Option<&'static rayon::ThreadPool>)>> = Mutex::new(Vec::new());
+    let threads = threads.min(MOST_THREADS);
+    let mut pools = POOLS.lock().ok()?;
+    if let Some(&(_, pool)) = pools.iter().find(|(size, _)| *size == threads) {
+        return pool;
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .ok()
+        .map(|pool| &*Box::leak(Box::new(pool)));
+    pools.push((threads, pool));
+    pool
 }
 
 pub(crate) struct BlockReader<'a> {
@@ -109,6 +174,12 @@ pub(crate) struct BlockReader<'a> {
     rows: usize,
     orientation: Option<usize>,
     last_good_variant: usize,
+    /// Fingerprints of the sampled grids that [`BlockReader::recognise_by_threshold`] found no block
+    /// in, by every variant it has; a grid seen again would fail again. Many cuts of a block that
+    /// is read again and again come out the same.
+    failed_grids: HashSet<u64>,
+    /// Fingerprints of the words that did not decode, whichever grid or variant they came from.
+    failed_words: HashSet<u64>,
     /// Where each readable block really sat compared with the fitted grid, in pixels.
     /// Crumpled paper bends the grid; a block sits near where its neighbours were.
     shifts: Vec<Option<(f64, f64)>>,
@@ -120,9 +191,16 @@ pub(crate) struct BlockReader<'a> {
     /// are no grid lines to follow.
     /// One mesh per prediction setting of [`MESH_TRUSTS`], each built when first needed.
     meshes: Vec<MeshState>,
+    /// Threads to try ways of reading a block on; 0 is as many as the processor has.
+    threads: usize,
     effort: Effort,
     /// Learns from the blocks that were read how dots look on this page.
     detector: DotDetector,
+    /// A copy made to try a way of reading a block keeps what the detector should learn from
+    /// the block, instead of learning it, so that the reader that takes over the result can
+    /// learn it in the order the blocks were read.
+    recording: bool,
+    lessons: Vec<(DotGrid, [[bool; BLOCK_DOTS]; BLOCK_DOTS])>,
     rotated: Vec<u8>,
     sharpened: Vec<u8>,
 }
@@ -174,12 +252,17 @@ impl<'a> BlockReader<'a> {
             rows,
             orientation: None,
             last_good_variant: 0,
+            failed_grids: HashSet::new(),
+            failed_words: HashSet::new(),
             shifts: vec![None; columns * rows],
             tilts: vec![None; columns * rows],
             page_angles: (grid.x_angle, grid.y_angle),
             meshes: MESH_TRUSTS.iter().map(|_| MeshState::NotBuilt).collect(),
+            threads: 1,
             effort: Effort::Quick,
             detector: DotDetector::new(),
+            recording: false,
+            lessons: Vec::new(),
             rotated: vec![0; buffer_width * buffer_height],
             sharpened: vec![0; buffer_width * buffer_height],
         }
@@ -235,69 +318,324 @@ impl<'a> BlockReader<'a> {
         if matches!(outcome, BlockOutcome::Readable { .. }) || self.effort == Effort::Quick {
             return outcome;
         }
-        // Through its own corners first: it is the cheaper of the two ways to follow bent paper,
-        // and the one that works when the straight grid is far off.
-        if let Some((block, corrected)) = self.read_warped(column, row) {
-            return BlockOutcome::Readable { block, corrected };
-        }
-        self.read_like_neighbours(column, row, outcome)
+        let ways = self.other_ways(column, row);
+        self.try_ways(column, row, outcome, &ways)
     }
 
-    /// Tries the shift and the rotation of the blocks around this one, and a few rotations
-    /// near theirs; `outcome` is what reading it where the grid says gave.
-    fn read_like_neighbours(
+    /// The ways to read a block that did not read where the grid says it is, in the order they
+    /// are tried: through its own corners first, which is the cheaper of the two ways to follow
+    /// bent paper and the one that works when the straight grid is far off, then with the shift
+    /// and the rotation of the blocks around it, and a few rotations near theirs.
+    fn other_ways(&self, column: usize, row: usize) -> Vec<Way> {
+        // A block that one mesh cannot read is tried with the next: whatever any of them reads is kept.
+        let meshes = if self.effort == Effort::Deep {
+            MESH_TRUSTS.len()
+        } else {
+            1
+        };
+        let mut ways: Vec<Way> = (0..meshes).map(Way::Warped).collect();
+        let neighbours = self.neighbour_shifts(column, row);
+        if let Some(average) = Self::mean(&neighbours) {
+            let tilt = self.neighbour_tilt(column, row);
+            let single_shifts = neighbours.into_iter().map(|shift| (shift, tilt));
+            let tilted = TILT_STEPS.iter().map(|step| (average, tilt + step));
+            let guesses = std::iter::once((average, tilt))
+                .chain(single_shifts)
+                .chain(tilted)
+                .take(if self.effort == Effort::Deep {
+                    MAX_POSE_TRIES
+                } else {
+                    NORMAL_POSE_TRIES
+                });
+            // Only the first guess gets every sharpness level; the rest are many and cheap.
+            ways.extend(
+                guesses
+                    .enumerate()
+                    .map(|(attempt, (shift, tilt))| Way::Posed {
+                        shift,
+                        tilt,
+                        every_level: attempt == 0,
+                    }),
+            );
+        }
+        ways
+    }
+
+    fn attempt(&mut self, way: &Way, column: usize, row: usize) -> Tried {
+        match *way {
+            Way::Warped(variant) => Tried::Warped(self.read_warped_with(variant, column, row)),
+            Way::Posed {
+                shift,
+                tilt,
+                every_level,
+            } => Tried::Posed(self.read_posed(column, row, shift, tilt, every_level)),
+        }
+    }
+
+    /// Tries the ways one after the other until one reads, or all at once on several threads and
+    /// takes the first that reads in the order of the list. The two give the same block, the
+    /// same record of where it sat, and the same lessons for the next ones: a way does not
+    /// depend on another having failed, and nothing is learned from a failure but which
+    /// words and grids to skip.
+    fn try_ways(
         &mut self,
         column: usize,
         row: usize,
-        mut outcome: BlockOutcome,
+        first: BlockOutcome,
+        ways: &[Way],
     ) -> BlockOutcome {
-        let neighbours = self.neighbour_shifts(column, row);
-        let Some(average) = Self::mean(&neighbours) else {
-            return outcome;
-        };
-        let tilt = self.neighbour_tilt(column, row);
-        let single_shifts = neighbours.into_iter().map(|shift| (shift, tilt));
-        let tilted = TILT_STEPS.iter().map(|step| (average, tilt + step));
-        let guesses = std::iter::once((average, tilt))
-            .chain(single_shifts)
-            .chain(tilted)
-            .take(if self.effort == Effort::Deep {
-                MAX_POSE_TRIES
-            } else {
-                NORMAL_POSE_TRIES
-            });
-        for (attempt, (shift, tilt)) in guesses.enumerate() {
-            if matches!(outcome, BlockOutcome::Readable { .. }) {
-                break;
+        let pool = (self.thread_count() > 1 && ways.len() > 1)
+            .then(|| pool_of(self.thread_count()))
+            .flatten();
+        let mut sequence = WaysTried::new(first);
+        let Some(pool) = pool else {
+            for way in ways {
+                let tried = self.attempt(way, column, row);
+                if let Some(done) = sequence.add(tried) {
+                    return done;
+                }
             }
-            // Only the first guess gets every sharpness level; the rest are many and cheap.
-            let retry = self.read_posed(column, row, shift, tilt, attempt == 0);
-            if matches!(retry, BlockOutcome::Readable { .. })
-                || matches!(outcome, BlockOutcome::Missing)
+            return sequence.outcome;
+        };
+        self.ensure_meshes(pool);
+        let this = &*self;
+        // A way is not tried once an earlier one has read: the later ones could not be used.
+        let first_to_read = AtomicUsize::new(usize::MAX);
+        let results: Vec<(Tried, BlockReader<'a>)> = pool.install(|| {
+            ways.par_iter()
+                .enumerate()
+                .filter_map(|(index, way)| {
+                    if first_to_read.load(Ordering::Relaxed) < index {
+                        return None;
+                    }
+                    let mut worker = this.fork();
+                    let tried = worker.attempt(way, column, row);
+                    if tried.read() {
+                        first_to_read.fetch_min(index, Ordering::Relaxed);
+                    }
+                    Some((tried, worker))
+                })
+                .collect()
+        });
+        let mut decided: Option<(BlockOutcome, BlockReader<'a>)> = None;
+        for (tried, worker) in results {
+            self.failed_grids.extend(&worker.failed_grids);
+            self.failed_words.extend(&worker.failed_words);
+            if decided.is_none()
+                && let Some(done) = sequence.add(tried)
             {
-                outcome = retry;
+                decided = Some((done, worker));
             }
         }
-        outcome
+        match decided {
+            Some((done, worker)) => {
+                self.absorb(worker, column, row);
+                done
+            }
+            None => sequence.outcome,
+        }
     }
 
     /// The corners of all blocks, found when first needed. `None` if there are no grid lines
     /// to follow.
     fn mesh(&mut self, variant: usize) -> Option<&Mesh> {
         if matches!(self.meshes[variant], MeshState::NotBuilt) {
-            self.meshes[variant] = Mesh::build(
+            self.meshes[variant] = self.build_mesh(variant);
+        }
+        match &self.meshes[variant] {
+            MeshState::Built(mesh) => Some(mesh),
+            MeshState::NotBuilt | MeshState::Missing => None,
+        }
+    }
+
+    fn build_mesh(&self, variant: usize) -> MeshState {
+        let build = |parallel| {
+            Mesh::build(
                 self.bitmap,
                 self.grid,
                 self.columns,
                 self.rows,
                 self.page_angles,
                 MESH_TRUSTS[variant],
+                parallel,
             )
-            .map_or(MeshState::Missing, MeshState::Built);
+        };
+        // On the pool of this reader, not on the global one, so that --threads holds.
+        let mesh = match pool_of(self.thread_count()).filter(|_| self.thread_count() > 1) {
+            Some(pool) => pool.install(|| build(true)),
+            None => build(false),
+        };
+        mesh.map_or(MeshState::Missing, |mesh| MeshState::Built(Arc::new(mesh)))
+    }
+
+    /// Builds the meshes of every setting, side by side: they do not depend on each other, and
+    /// the blocks that are tried with several ways need them all sooner or later, the first one
+    /// at once. With threads to spare this costs the time of one.
+    fn ensure_meshes(&mut self, pool: &rayon::ThreadPool) {
+        let missing: Vec<usize> = (0..MESH_TRUSTS.len())
+            .filter(|&variant| matches!(self.meshes[variant], MeshState::NotBuilt))
+            .collect();
+        let built: Vec<(usize, MeshState)> = pool.install(|| {
+            missing
+                .par_iter()
+                .map(|&variant| (variant, self.build_mesh(variant)))
+                .collect()
+        });
+        for (variant, mesh) in built {
+            self.meshes[variant] = mesh;
         }
-        match &self.meshes[variant] {
-            MeshState::Built(mesh) => Some(mesh),
-            MeshState::NotBuilt | MeshState::Missing => None,
+    }
+
+    /// Sets how many threads ways of reading a block are tried on; 0 is as many as the
+    /// processor has and 1 is one after the other.
+    pub(crate) fn set_threads(&mut self, threads: usize) {
+        self.threads = threads;
+    }
+
+    fn thread_count(&self) -> usize {
+        if self.threads == 0 {
+            std::thread::available_parallelism().map_or(1, usize::from)
+        } else {
+            self.threads
+        }
+    }
+
+    /// A reader that starts where this one is and can try a way of reading a block on another
+    /// thread. It has no memory of failures; what it learns is taken over by [`Self::absorb`].
+    fn fork(&self) -> BlockReader<'a> {
+        self.fork_with_threads(1)
+    }
+
+    fn fork_with_threads(&self, threads: usize) -> BlockReader<'a> {
+        BlockReader {
+            bitmap: self.bitmap,
+            grid: self.grid,
+            intensity: self.intensity,
+            sharpness: self.sharpness,
+            base_sharpness: self.base_sharpness,
+            boosts: self.boosts.clone(),
+            border: self.border,
+            buffer_width: self.buffer_width,
+            buffer_height: self.buffer_height,
+            max_dot_size: self.max_dot_size,
+            columns: self.columns,
+            rows: self.rows,
+            orientation: self.orientation,
+            last_good_variant: self.last_good_variant,
+            failed_grids: HashSet::new(),
+            failed_words: HashSet::new(),
+            shifts: self.shifts.clone(),
+            tilts: self.tilts.clone(),
+            page_angles: self.page_angles,
+            meshes: self.meshes.clone(),
+            threads,
+            effort: self.effort,
+            detector: self.detector.clone(),
+            recording: true,
+            lessons: Vec::new(),
+            rotated: vec![0; self.rotated.len()],
+            sharpened: vec![0; self.sharpened.len()],
+        }
+    }
+
+    /// What reading a block can change for blocks that are not next to it: the orientation of
+    /// the page, the variant that read last (it decides which variant is tried first, and the
+    /// deepest effort repairs that variant's reading) and how often the model of the dots was
+    /// fitted.
+    pub(crate) fn global_state(&self) -> (Option<usize>, usize, usize) {
+        (
+            self.orientation,
+            self.last_good_variant,
+            self.detector.fits(),
+        )
+    }
+
+    /// Starts building the meshes, on all threads, for a pass over blocks that did not read.
+    pub(crate) fn prepare_meshes(&mut self) {
+        if self.thread_count() > 1
+            && let Some(pool) = pool_of(self.thread_count())
+        {
+            self.ensure_meshes(pool);
+        }
+    }
+
+    /// How many blocks to read side by side: the threads there are, or 1 if reading is not on
+    /// several threads.
+    pub(crate) fn batch_width(&self) -> usize {
+        if self.thread_count() > 1 && pool_of(self.thread_count()).is_some() {
+            self.thread_count()
+        } else {
+            1
+        }
+    }
+
+    /// Reads several blocks side by side, each as [`Self::read`] would from the state of the
+    /// reader now; `None` for those not read because one before them read. Only as many of the results as come before the first block that reads may be
+    /// used: reading a block changes what the blocks after it start from.
+    pub(crate) fn read_side_by_side(
+        &mut self,
+        cells: &[(usize, usize)],
+    ) -> Vec<Option<Speculation<'a>>> {
+        let Some(pool) = pool_of(self.thread_count()) else {
+            return Vec::new();
+        };
+        self.ensure_meshes(pool);
+        let this = &*self;
+        // Cells after one that has read are left out: the caller stops at that one.
+        let first_to_read = AtomicUsize::new(usize::MAX);
+        pool.install(|| {
+            cells
+                .par_iter()
+                .enumerate()
+                .map(|(index, &(column, row))| {
+                    if first_to_read.load(Ordering::Relaxed) < index {
+                        return None;
+                    }
+                    let mut worker = this.fork_with_threads(this.threads);
+                    let outcome = worker.read(column, row);
+                    if matches!(outcome, BlockOutcome::Readable { .. }) {
+                        first_to_read.fetch_min(index, Ordering::Relaxed);
+                    }
+                    Some(Speculation { outcome, worker })
+                })
+                .collect()
+        })
+    }
+
+    /// What a speculative reading of the block (`column`, `row`) failed to read is noted, so that
+    /// it is not tried again.
+    pub(crate) fn note_failures(&mut self, speculation: &Speculation<'a>) {
+        self.failed_grids.extend(&speculation.worker.failed_grids);
+        self.failed_words.extend(&speculation.worker.failed_words);
+    }
+
+    /// Takes over a speculative reading that read the block (`column`, `row`) as if it had been
+    /// made here: the outcome, and what it learned, failures included.
+    pub(crate) fn accept(
+        &mut self,
+        speculation: Speculation<'a>,
+        column: usize,
+        row: usize,
+    ) -> BlockOutcome {
+        self.note_failures(&speculation);
+        self.absorb(speculation.worker, column, row);
+        speculation.outcome
+    }
+
+    /// Takes over what a fork learned from reading the block (`column`, `row`).
+    fn absorb(&mut self, worker: BlockReader<'a>, column: usize, row: usize) {
+        let at = row * self.columns + column;
+        self.shifts[at] = worker.shifts[at];
+        self.tilts[at] = worker.tilts[at];
+        self.orientation = worker.orientation;
+        self.last_good_variant = worker.last_good_variant;
+        if self.recording {
+            // A copy that took over from one of its own copies passes the lessons on.
+            self.lessons.extend(worker.lessons);
+        } else {
+            for (grid, dark_dots) in worker.lessons {
+                self.detector.learn(&grid, &dark_dots);
+            }
         }
     }
 
@@ -317,16 +655,6 @@ impl<'a> BlockReader<'a> {
     /// Reads a block through its own four corners, which follow bent or creased paper.
     /// Only blocks with at least three corners found in the picture are tried, so the empty
     /// margin of the page costs nothing.
-    fn read_warped(&mut self, column: usize, row: usize) -> Option<(RawBlock, usize)> {
-        // A block that one mesh cannot read is tried with the next: whatever any of them reads is kept.
-        let meshes = if self.effort == Effort::Deep {
-            MESH_TRUSTS.len()
-        } else {
-            1
-        };
-        (0..meshes).find_map(|variant| self.read_warped_with(variant, column, row))
-    }
-
     fn read_warped_with(
         &mut self,
         variant: usize,
@@ -432,12 +760,13 @@ impl<'a> BlockReader<'a> {
             *row ^= row_mask(j);
         }
         let mut block = RawBlock::from_rows(&rows);
-        let corrected = block.correct().filter(|&n| n <= MAX_CORRECTIONS)?;
+        let corrected = block.correct_up_to(MAX_CORRECTIONS)?;
         block_crc_matches(&block).then_some((block, corrected))
     }
 
     /// The 32x32 dots of a block as gray levels, each the average of a few samples around
     /// the dot's place inside the quadrilateral.
+    #[cfg_attr(feature = "profile", inline(never))]
     fn sample_quad(&self, quad: &Quad, window: f64, shift: (f64, f64)) -> DotGrid {
         let cell = BLOCK_DOTS as f64 + 3.0;
         let pitch = {
@@ -649,6 +978,7 @@ impl<'a> BlockReader<'a> {
         outcome
     }
 
+    #[cfg_attr(feature = "profile", inline(never))]
     fn read_shifted(
         &mut self,
         column: usize,
@@ -664,9 +994,11 @@ impl<'a> BlockReader<'a> {
             + shift.1) as i32;
         let mut outcome = BlockOutcome::Missing;
         let levels = if every_level { self.boosts.len() } else { 1 };
+        // The block is cut out of the page once; each sharpness level starts from that cut.
+        self.resample(x0, y0);
         for boost in self.boosts.clone().into_iter().take(levels) {
             self.sharpness = (self.base_sharpness * boost.0 + boost.1).min(MAX_SHARPNESS);
-            self.resample(x0, y0);
+            self.apply_sharpness();
             let guided = shift != (0.0, 0.0) || tilt != 0.0;
             let found = self.locate_block();
             let predicted = found.is_none() && guided;
@@ -718,76 +1050,99 @@ impl<'a> BlockReader<'a> {
         )
     }
 
-    /// Cuts the block out of the page, undoing the tilt by bilinear interpolation,
-    /// and sharpens it when the scan is blurred.
+    /// Cuts the block out of the page into `sharpened`, undoing the tilt by bilinear
+    /// interpolation. It is not sharpened yet; see [`Self::apply_sharpness`].
+    #[cfg_attr(feature = "profile", inline(never))]
     fn resample(&mut self, x0: i32, y0: i32) {
         let (bw, bh) = (self.buffer_width, self.buffer_height);
         let (sx, sy) = (self.bitmap.width() as i32, self.bitmap.height() as i32);
-        let sharpen = self.sharpness > 0.0;
-        let target = if sharpen {
-            &mut self.sharpened
-        } else {
-            &mut self.rotated
-        };
+        let target = &mut self.sharpened;
         let white = self.intensity.max as u8;
-        for j in 0..bh {
-            let x_exact = f64::from(x0) + f64::from(y0 + j as i32) * self.grid.x_angle;
+        let (pixels, width) = (self.bitmap.pixels(), self.bitmap.width());
+        // How far each column of the block lies above or below its row because of the tilt.
+        let column_rise: Vec<f64> = (0..bw)
+            .map(|i| f64::from(x0 + i as i32) * self.grid.y_angle)
+            .collect();
+        for (j, out) in target.chunks_exact_mut(bw).take(bh).enumerate() {
+            let row = f64::from(y0 + j as i32);
+            let x_exact = f64::from(x0) + row * self.grid.x_angle;
             let x_whole = if x_exact >= 0.0 {
                 x_exact as i32
             } else {
                 (x_exact - 1.0) as i32
             };
             let x_fraction = x_exact - f64::from(x_whole);
-            for i in 0..bw {
+            for (i, (slot, &rise)) in out.iter_mut().zip(&column_rise).enumerate() {
                 let x = x_whole + i as i32;
-                let y_exact =
-                    f64::from(y0 + j as i32) + f64::from(x0 + i as i32) * self.grid.y_angle;
+                let y_exact = row + rise;
                 let y = if y_exact > 0.0 {
                     y_exact as i32
                 } else {
                     (y_exact - 1.0) as i32
                 };
-                let y_fraction = y_exact - f64::from(y);
-                target[j * bw + i] = if x < 0 || x >= sx - 1 || y < 0 || y >= sy - 1 {
+                *slot = if x < 0 || x >= sx - 1 || y < 0 || y >= sy - 1 {
                     white
                 } else {
-                    let (x, y) = (x as usize, y as usize);
-                    let p = |dx: usize, dy: usize| f64::from(self.bitmap.at(x + dx, y + dy));
-                    ((p(0, 0) + (p(1, 0) - p(0, 0)) * x_fraction) * (1.0 - y_fraction)
-                        + (p(0, 1) + (p(1, 1) - p(0, 1)) * x_fraction) * y_fraction)
+                    let y_fraction = y_exact - f64::from(y);
+                    let at = y as usize * width + x as usize;
+                    let p = |offset: usize| f64::from(pixels[at + offset]);
+                    ((p(0) + (p(1) - p(0)) * x_fraction) * (1.0 - y_fraction)
+                        + (p(width) + (p(width + 1) - p(width)) * x_fraction) * y_fraction)
                         as u8
                 };
             }
         }
-        if sharpen {
+    }
+
+    /// Makes `rotated` from the cut-out block: sharpened when the level asks for it, else as it is.
+    fn apply_sharpness(&mut self) {
+        if self.sharpness > 0.0 {
             self.sharpen();
+        } else {
+            self.rotated.copy_from_slice(&self.sharpened);
         }
     }
 
+    /// Unsharp mask over the inside of the block; the outermost pixels are kept.
+    #[cfg_attr(feature = "profile", inline(never))]
     fn sharpen(&mut self) {
         let (bw, bh) = (self.buffer_width, self.buffer_height);
         let s = self.sharpness;
+        let gain = 1.0 + 4.0 * s;
         let (low, high) = (self.intensity.min, self.intensity.max);
-        for j in 0..bh {
-            for i in 0..bw {
-                let at = j * bw + i;
-                self.rotated[at] = if i == 0 || i == bw - 1 || j == 0 || j == bh - 1 {
-                    self.sharpened[at]
-                } else {
-                    let c = f64::from(self.sharpened[at]);
-                    let around = f64::from(self.sharpened[at - bw])
-                        + f64::from(self.sharpened[at - 1])
-                        + f64::from(self.sharpened[at + 1])
-                        + f64::from(self.sharpened[at + bw]);
-                    ((c * (1.0 + 4.0 * s) - around * s) as i32)
-                        .min(high)
-                        .max(low) as u8
-                };
+        let (source, target) = (&self.sharpened, &mut self.rotated);
+        if bw < 3 || bh < 3 {
+            // No pixel has all four neighbours.
+            target[..bw * bh].copy_from_slice(&source[..bw * bh]);
+            return;
+        }
+        target[..bw].copy_from_slice(&source[..bw]);
+        target[(bh - 1) * bw..].copy_from_slice(&source[(bh - 1) * bw..]);
+        for j in 1..bh - 1 {
+            let row = j * bw;
+            target[row] = source[row];
+            target[row + bw - 1] = source[row + bw - 1];
+            // Rows of equal length, so that the loop has no bounds checks and no branches.
+            let out = &mut target[row + 1..row + bw - 1];
+            let centre = &source[row + 1..row + bw - 1];
+            let up = &source[row - bw + 1..row - 1];
+            let down = &source[row + bw + 1..row + 2 * bw - 1];
+            let left = &source[row..row + bw - 2];
+            let right = &source[row + 2..row + bw];
+            for i in 0..bw - 2 {
+                let around = f64::from(up[i])
+                    + f64::from(left[i])
+                    + f64::from(right[i])
+                    + f64::from(down[i]);
+                out[i] = ((f64::from(centre[i]) * gain - around * s) as i32)
+                    .min(high)
+                    .max(low) as u8;
             }
         }
     }
 
     /// Finds the exact grid lines of this block; `None` if there is no grid.
+    #[cfg_attr(feature = "profile", inline(never))]
     fn locate_block(&self) -> Option<BlockFit> {
         let (bw, bh) = (self.buffer_width, self.buffer_height);
         let mut column_sums = vec![0i32; bw];
@@ -817,16 +1172,24 @@ impl<'a> BlockReader<'a> {
         })
     }
 
+    #[cfg_attr(feature = "profile", inline(never))]
     fn read_dots(&mut self, fit: &BlockFit) -> Option<(RawBlock, usize)> {
         for dot_size in 1..=self.max_dot_size {
-            let shifted = self.sample_shifted_grids(fit, dot_size);
-            if let Some(found) = self.recognise(&shifted[CENTER_SHIFT]) {
+            // Most blocks read from the unshifted sampling; the other eight are sampled only
+            // for those that do not.
+            let centre = self.sample_grid(fit, dot_size, CENTER_SHIFT);
+            if let Some(found) = self.recognise(&centre) {
                 return Some(found);
             }
             if self.effort == Effort::Quick {
                 continue;
             }
-            if let Some(found) = self.recognise(&best_focused_grid(&shifted)) {
+            let shifted = self.sample_shifted_grids(fit, dot_size);
+            let focused = best_focused_grid(&shifted);
+            // The same samples as before would only fail again.
+            if focused != centre
+                && let Some(found) = self.recognise(&focused)
+            {
                 return Some(found);
             }
         }
@@ -835,19 +1198,25 @@ impl<'a> BlockReader<'a> {
 
     /// Samples the 32x32 dots nine times, shifted by up to one pixel in every direction.
     fn sample_shifted_grids(&self, fit: &BlockFit, dot_size: usize) -> Vec<DotGrid> {
+        (0..SHIFT_COUNT)
+            .map(|shift| self.sample_grid(fit, dot_size, shift))
+            .collect()
+    }
+
+    /// Samples the 32x32 dots once, shifted as number `shift` of the nine says.
+    #[cfg_attr(feature = "profile", inline(never))]
+    fn sample_grid(&self, fit: &BlockFit, dot_size: usize, shift: usize) -> DotGrid {
         let half_dot = dot_size as f64 / 2.0 - 1.0;
-        let mut grids = vec![[[0u8; BLOCK_DOTS]; BLOCK_DOTS]; SHIFT_COUNT];
-        for j in 0..BLOCK_DOTS {
+        let (dy, dx) = ((shift / 3) as i32 - 1, (shift % 3) as i32 - 1);
+        let mut grid = [[0u8; BLOCK_DOTS]; BLOCK_DOTS];
+        for (j, row) in grid.iter_mut().enumerate() {
             let y = (fit.y_origin + fit.y_pitch * j as f64 - half_dot) as i32;
-            for i in 0..BLOCK_DOTS {
+            for (i, dot) in row.iter_mut().enumerate() {
                 let x = (fit.x_origin + fit.x_pitch * i as f64 - half_dot) as i32;
-                for (shift, grid) in grids.iter_mut().enumerate() {
-                    let (dy, dx) = ((shift / 3) as i32 - 1, (shift % 3) as i32 - 1);
-                    grid[j][i] = self.average_dot(x + dx, y + dy, dot_size);
-                }
+                *dot = self.average_dot(x + dx, y + dy, dot_size);
             }
         }
-        grids
+        grid
     }
 
     fn pixel(&self, x: i32, y: i32) -> i32 {
@@ -857,7 +1226,37 @@ impl<'a> BlockReader<'a> {
         i32::from(self.rotated[y as usize * self.buffer_width + x as usize])
     }
 
+    #[cfg_attr(feature = "profile", inline(never))]
     fn average_dot(&self, x: i32, y: i32, dot_size: usize) -> u8 {
+        let (width, height) = (self.buffer_width, self.buffer_height);
+        // Well inside the buffer, which is nearly always, no pixel needs a check.
+        if x >= 0 && y >= 0 && (x as usize) + 3 < width && (y as usize) + 3 < height {
+            let at = y as usize * width + x as usize;
+            let p = |dx: usize, dy: usize| i32::from(self.rotated[at + dy * width + dx]);
+            return match dot_size {
+                4 => {
+                    ((p(1, 0) + p(2, 0))
+                        + (p(0, 1) + p(1, 1) + p(2, 1) + p(3, 1))
+                        + (p(0, 2) + p(1, 2) + p(2, 2) + p(3, 2))
+                        + (p(1, 3) + p(2, 3)))
+                        / 12
+                }
+                3 => {
+                    (p(0, 0)
+                        + p(1, 0)
+                        + p(2, 0)
+                        + p(0, 1)
+                        + p(1, 1)
+                        + p(2, 1)
+                        + p(0, 2)
+                        + p(1, 2)
+                        + p(2, 2))
+                        / 9
+                }
+                2 => (p(0, 0) + p(1, 0) + p(0, 1) + p(1, 1)) / 4,
+                _ => p(0, 0),
+            } as u8;
+        }
         let sum_of = |cells: &[(i32, i32)]| -> i32 {
             cells
                 .iter()
@@ -914,6 +1313,7 @@ impl<'a> BlockReader<'a> {
     /// orientations of [`orient`] count in the transposed picture, because the neighbour
     /// correction of the original reads the centre dot transposed (see `overlap_corrected`);
     /// the detector works on the samples as they are, hence `b` before `a` below.
+    #[cfg_attr(feature = "profile", inline(never))]
     fn learn_from(&mut self, grid: &DotGrid, block: &RawBlock) {
         let Some(orientation) = self.orientation else {
             return;
@@ -927,11 +1327,16 @@ impl<'a> BlockReader<'a> {
                 dark_dots[b][a] = dark >> i & 1 == 1;
             }
         }
-        self.detector.learn(grid, &dark_dots);
+        if self.recording {
+            self.lessons.push((*grid, dark_dots));
+        } else {
+            self.detector.learn(grid, &dark_dots);
+        }
     }
 
     /// Reads the dots with the detector fitted to this page, and repairs the bits, with the
     /// bytes it was least sure about as erasures if need be.
+    #[cfg_attr(feature = "profile", inline(never))]
     fn recognise_learned(&self, grid: &DotGrid) -> Option<(RawBlock, usize)> {
         let orientation = self.orientation?;
         if !self.detector.is_ready() {
@@ -954,7 +1359,7 @@ impl<'a> BlockReader<'a> {
         }
         let block = RawBlock::from_rows(&rows);
         let mut direct = block.clone();
-        if let Some(corrected) = direct.correct().filter(|&n| n <= MAX_CORRECTIONS)
+        if let Some(corrected) = direct.correct_up_to(MAX_CORRECTIONS)
             && block_crc_matches(&direct)
         {
             return Some((direct, corrected));
@@ -965,7 +1370,27 @@ impl<'a> BlockReader<'a> {
     /// Turns sampled gray levels into bits and repairs them. Tries every
     /// orientation until one is known, and several neighbour-overlap and
     /// threshold variants, starting with the one that worked last.
+    #[cfg_attr(feature = "profile", inline(never))]
     fn recognise_by_threshold(&mut self, grid: &DotGrid) -> Option<(RawBlock, usize)> {
+        // With the quick effort the variants tried depend on the one that worked last, so a
+        // failure says little about a later try; with more effort every variant is tried. The
+        // deepest effort also repairs the first reading, which is the one of the variant that
+        // worked last, so there a failure holds only while that variant is the same.
+        let grid_key = (self.effort >= Effort::Normal).then(|| {
+            fingerprint(grid.as_flattened())
+                ^ if self.effort == Effort::Deep {
+                    DEEP_TAG.wrapping_mul(self.last_good_variant as u64 + 1)
+                } else {
+                    0
+                }
+        });
+        if grid_key.is_some_and(|key| self.failed_grids.contains(&key)) {
+            return None;
+        }
+        // The neighbour correction does not depend on the orientation or on whether the limit is
+        // taken per quadrant, so each variant needs it once per grid.
+        let mut corrected_grids: [Option<Corrected>; THRESHOLD_VARIANTS] =
+            std::array::from_fn(|_| None);
         for orientation in 0..ORIENTATIONS {
             if self.orientation.is_some_and(|known| known != orientation) {
                 continue;
@@ -983,33 +1408,33 @@ impl<'a> BlockReader<'a> {
             for (attempt, local) in tries {
                 let variant = (attempt + self.last_good_variant) % THRESHOLD_VARIANTS;
                 let (weight, threshold_shift) = self.variant_parameters(variant);
-                let adjusted = overlap_corrected(grid, weight, self.intensity.max);
-                let limits = if local {
-                    quadrant_limits(&adjusted, threshold_shift * weight)
-                } else {
-                    let whole =
-                        adjusted.iter().flatten().sum::<i32>() / 1024 + threshold_shift * weight;
-                    [[whole; 2]; 2]
-                };
+                let white = self.intensity.max;
+                let corrected_grid = corrected_grids[variant]
+                    .get_or_insert_with(|| Corrected::of(grid, weight, white));
+                let limits = corrected_grid.limits(local, threshold_shift * weight);
+                let adjusted = &corrected_grid.adjusted;
+                let map = orientation_map(orientation);
                 let mut rows = [0u32; BLOCK_DOTS];
-                let mut certainty = [i32::MAX; BLOCK_LEN];
                 for (j, row) in rows.iter_mut().enumerate() {
-                    for i in 0..BLOCK_DOTS {
-                        let (a, b) = orient(orientation, j, i);
-                        let limit = limits[a / QUADRANT][b / QUADRANT];
-                        if adjusted[a][b] < limit {
-                            *row |= 1 << i;
-                        }
-                        let byte = j * 4 + i / 8;
-                        certainty[byte] = certainty[byte].min((adjusted[a][b] - limit).abs());
+                    for (i, &(a, b)) in map[j].iter().enumerate() {
+                        let limit = limits[usize::from(a) / QUADRANT][usize::from(b) / QUADRANT];
+                        *row |= u32::from(adjusted[usize::from(a)][usize::from(b)] < limit) << i;
                     }
                     *row ^= row_mask(j);
                 }
                 let mut block = RawBlock::from_rows(&rows);
+                // How sure each byte is matters only to the repair of the first reading.
                 if attempt == 0 && !local {
-                    doubtful = Some((block.clone(), certainty));
+                    doubtful = Some((block.clone(), certainty_of(adjusted, &limits, map)));
                 }
-                let Some(corrected) = block.correct().filter(|&n| n <= MAX_CORRECTIONS) else {
+                // A word that did not decode does not decode when another variant or another cut
+                // gives it again.
+                let word = fingerprint(&block.0);
+                if self.failed_words.contains(&word) {
+                    continue;
+                }
+                let Some(corrected) = block.correct_up_to(MAX_CORRECTIONS) else {
+                    self.failed_words.insert(word);
                     continue;
                 };
                 if block_crc_matches(&block) {
@@ -1017,6 +1442,7 @@ impl<'a> BlockReader<'a> {
                     self.last_good_variant = variant;
                     return Some((block, corrected));
                 }
+                self.failed_words.insert(word);
             }
             // Nothing read as it is: treat the bytes whose dots were hardest to tell apart
             // as erased, which doubles what the error correction can repair.
@@ -1027,6 +1453,9 @@ impl<'a> BlockReader<'a> {
                 self.orientation = Some(orientation);
                 return Some(found);
             }
+        }
+        if let Some(key) = grid_key {
+            self.failed_grids.insert(key);
         }
         None
     }
@@ -1043,6 +1472,54 @@ impl<'a> BlockReader<'a> {
     }
 }
 
+/// Mixed into the fingerprint of a grid read with the deepest effort, which tries more.
+const DEEP_TAG: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// A 64-bit fingerprint of some bytes, to tell sampled grids and decoded words apart; it is not
+/// meant to resist anyone who tries to make two collide.
+fn fingerprint(bytes: &[u8]) -> u64 {
+    const MULTIPLIER: u64 = 0x517c_c1b7_2722_0a95;
+    let (words, rest) = bytes.as_chunks::<8>();
+    let mut hash = bytes.len() as u64;
+    for word in words {
+        hash = (hash.rotate_left(5) ^ u64::from_le_bytes(*word)).wrapping_mul(MULTIPLIER);
+    }
+    for &byte in rest {
+        hash = (hash.rotate_left(5) ^ u64::from(byte)).wrapping_mul(MULTIPLIER);
+    }
+    hash ^ (hash >> 29)
+}
+
+/// The ways of reading a block that were tried so far, and what the first reading of it gave.
+struct WaysTried {
+    outcome: BlockOutcome,
+}
+
+impl WaysTried {
+    fn new(first: BlockOutcome) -> Self {
+        Self { outcome: first }
+    }
+
+    /// Adds what the next way gave; the outcome of the block if that settles it.
+    fn add(&mut self, tried: Tried) -> Option<BlockOutcome> {
+        match tried {
+            Tried::Warped(Some((block, corrected))) => {
+                Some(BlockOutcome::Readable { block, corrected })
+            }
+            Tried::Warped(None) => None,
+            Tried::Posed(retry) => {
+                if matches!(retry, BlockOutcome::Readable { .. }) {
+                    return Some(retry);
+                }
+                if matches!(self.outcome, BlockOutcome::Missing) {
+                    self.outcome = retry;
+                }
+                None
+            }
+        }
+    }
+}
+
 struct BlockFit {
     x_origin: f64,
     y_origin: f64,
@@ -1056,18 +1533,83 @@ const QUADRANT: usize = BLOCK_DOTS / 2;
 /// Quadrants of a block.
 const QUADRANTS: usize = 4;
 
-fn quadrant_limits(adjusted: &[[i32; BLOCK_DOTS]; BLOCK_DOTS], shift: i32) -> [[i32; 2]; 2] {
-    let mut limits = [[0; 2]; 2];
-    for (q_row, limit_row) in limits.iter_mut().enumerate() {
-        for (q_col, limit) in limit_row.iter_mut().enumerate() {
-            let sum: i32 = adjusted[q_row * QUADRANT..(q_row + 1) * QUADRANT]
-                .iter()
-                .flat_map(|row| &row[q_col * QUADRANT..(q_col + 1) * QUADRANT])
-                .sum();
-            *limit = sum / (QUADRANT * QUADRANT) as i32 + shift;
+/// The gray levels of a block after the neighbours' brightness is subtracted.
+type Adjusted = [[i32; BLOCK_DOTS]; BLOCK_DOTS];
+
+/// A block's gray levels after the neighbour correction, with what the black and white limits are
+/// made of: the sum over the whole block and over each quadrant.
+struct Corrected {
+    adjusted: Adjusted,
+    total: i32,
+    quadrants: [[i32; 2]; 2],
+}
+
+impl Corrected {
+    fn of(grid: &DotGrid, weight: i32, white: i32) -> Self {
+        let adjusted = overlap_corrected(grid, weight, white);
+        let mut quadrants = [[0i32; 2]; 2];
+        for (j, row) in adjusted.iter().enumerate() {
+            for (q_col, half) in row.as_chunks::<QUADRANT>().0.iter().enumerate() {
+                quadrants[j / QUADRANT][q_col] += half.iter().sum::<i32>();
+            }
+        }
+        let total = quadrants.iter().flatten().sum();
+        Self {
+            adjusted,
+            total,
+            quadrants,
         }
     }
-    limits
+
+    /// The limit between black and white of each quadrant: the mean of the block or of the
+    /// quadrant, moved by `shift`.
+    fn limits(&self, per_quadrant: bool, shift: i32) -> [[i32; 2]; 2] {
+        if per_quadrant {
+            self.quadrants
+                .map(|row| row.map(|sum| sum / (QUADRANT * QUADRANT) as i32 + shift))
+        } else {
+            [[self.total / 1024 + shift; 2]; 2]
+        }
+    }
+}
+
+/// How far the gray level of the dots of each byte of a block is from the limit, the least of
+/// the eight; small means that the byte may have been read wrongly.
+fn certainty_of(
+    adjusted: &Adjusted,
+    limits: &[[i32; 2]; 2],
+    map: &OrientationMap,
+) -> [i32; BLOCK_LEN] {
+    let mut certainty = [i32::MAX; BLOCK_LEN];
+    for (j, row) in map.iter().enumerate() {
+        for (i, &(a, b)) in row.iter().enumerate() {
+            let (a, b) = (usize::from(a), usize::from(b));
+            let limit = limits[a / QUADRANT][b / QUADRANT];
+            let byte = j * 4 + i / 8;
+            certainty[byte] = certainty[byte].min((adjusted[a][b] - limit).abs());
+        }
+    }
+    certainty
+}
+
+/// For each place of a block as it is read in one of the eight orientations, the dot of the
+/// sampled grid that goes there (see [`orient`]).
+type OrientationMap = [[(u8, u8); BLOCK_DOTS]; BLOCK_DOTS];
+
+fn orientation_map(orientation: usize) -> &'static OrientationMap {
+    static MAPS: OnceLock<Vec<OrientationMap>> = OnceLock::new();
+    &MAPS.get_or_init(|| {
+        (0..ORIENTATIONS)
+            .map(|o| {
+                std::array::from_fn(|j| {
+                    std::array::from_fn(|i| {
+                        let (a, b) = orient(o, j, i);
+                        (a as u8, b as u8)
+                    })
+                })
+            })
+            .collect()
+    })[orientation]
 }
 
 /// Erased bytes tried for a block that does not read as it is. Each erased byte costs one
@@ -1078,6 +1620,7 @@ const ERASURE_COUNTS: [usize; 2] = [16, 24];
 
 /// Tries the least certain bytes of `block` as erasures; the repaired block must pass its
 /// checksum. Returns it with the number of bytes that changed.
+#[cfg_attr(feature = "profile", inline(never))]
 fn repair_doubtful_bytes(
     block: &RawBlock,
     certainty: &[i32; BLOCK_LEN],
@@ -1094,6 +1637,7 @@ fn repair_doubtful_bytes(
     })
 }
 
+#[cfg_attr(feature = "profile", inline(never))]
 fn block_crc_matches(block: &RawBlock) -> bool {
     debug_assert_eq!(ECC_PAD + 1, 128);
     crc16(&block.0[..CRC_COVERED]) ^ CRC_MASK
@@ -1118,33 +1662,34 @@ fn orient(orientation: usize, j: usize, i: usize) -> (usize, usize) {
 
 /// Subtracts the neighbours' brightness to undo dots bleeding into each other.
 /// Indexing mirrors the original program exactly.
-fn overlap_corrected(grid: &DotGrid, weight: i32, white: i32) -> [[i32; BLOCK_DOTS]; BLOCK_DOTS] {
+#[cfg_attr(feature = "profile", inline(never))]
+fn overlap_corrected(grid: &DotGrid, weight: i32, white: i32) -> Adjusted {
     let last = BLOCK_DOTS - 1;
-    let mut result = [[0i32; BLOCK_DOTS]; BLOCK_DOTS];
-    for j in 0..BLOCK_DOTS {
-        for i in 0..BLOCK_DOTS {
-            let mut c = i32::from(grid[i][j]) * weight;
-            c -= if i > 0 {
+    // Rows with a white dot added at both ends, and a white row beyond the first and the last,
+    // so that the loop below needs no test for the edge.
+    let padded: [[i32; BLOCK_DOTS + 2]; BLOCK_DOTS] = std::array::from_fn(|j| {
+        std::array::from_fn(|i| {
+            if (1..=BLOCK_DOTS).contains(&i) {
                 i32::from(grid[j][i - 1])
             } else {
                 white
-            };
-            c -= if i < last {
-                i32::from(grid[j][i + 1])
-            } else {
-                white
-            };
-            c -= if j > 0 {
-                i32::from(grid[j - 1][i])
-            } else {
-                white
-            };
-            c -= if j < last {
-                i32::from(grid[j + 1][i])
-            } else {
-                white
-            };
-            result[j][i] = c;
+            }
+        })
+    });
+    let blank = [white; BLOCK_DOTS + 2];
+    // The dot itself is read with its row and column swapped, as the original does.
+    let transposed: DotGrid = std::array::from_fn(|j| std::array::from_fn(|i| grid[i][j]));
+    let mut result = [[0i32; BLOCK_DOTS]; BLOCK_DOTS];
+    for (j, out) in result.iter_mut().enumerate() {
+        let here = &padded[j];
+        let above = if j > 0 { &padded[j - 1] } else { &blank };
+        let below = if j < last { &padded[j + 1] } else { &blank };
+        for i in 0..BLOCK_DOTS {
+            out[i] = i32::from(transposed[j][i]) * weight
+                - here[i]
+                - here[i + 2]
+                - above[i + 1]
+                - below[i + 1];
         }
     }
     result
@@ -1152,6 +1697,7 @@ fn overlap_corrected(grid: &DotGrid, weight: i32, white: i32) -> [[i32; BLOCK_DO
 
 /// Assembles a grid from the shifted version with the strongest contrast in
 /// each 8x8 sub-block; this compensates small distortions of the scan.
+#[cfg_attr(feature = "profile", inline(never))]
 fn best_focused_grid(shifted: &[DotGrid]) -> DotGrid {
     let mut combined = [[0u8; BLOCK_DOTS]; BLOCK_DOTS];
     for top in (0..BLOCK_DOTS).step_by(SUBBLOCK_SIZE) {

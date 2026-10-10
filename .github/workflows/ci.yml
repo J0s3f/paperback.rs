@@ -19,7 +19,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # x86-64 on Linux, Windows and macOS (Intel), 64-bit ARM on Linux and macOS (Apple silicon).
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-latest, macos-15-intel]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -35,6 +36,34 @@ jobs:
       # not needed.
       - name: Test
         run: cargo test --workspace --locked
+      # The error correction has vector code for the processors that have it; its tests try every
+      # level the runner's processor offers. This step shows which: the line "levels tried" lists
+      # them (a runner with GFNI tests that path), and the speed of each follows.
+      - name: Vector code tested on this runner
+        shell: bash
+        run: |
+          set -o pipefail
+          case "$RUNNER_OS" in
+            Linux)
+              grep -m1 -E 'model name|Model name' /proc/cpuinfo || lscpu | grep -i 'model name' || true
+              echo "features:" $(grep -m1 -E '^(flags|Features)' /proc/cpuinfo | grep -o -w -E 'ssse3|avx2|gfni|avx512f|asimd|pmull|aes' | sort -u)
+              ;;
+            macOS)
+              sysctl -n machdep.cpu.brand_string
+              echo "features:" $(sysctl -n machdep.cpu.features machdep.cpu.leaf7_features 2>/dev/null | grep -o -w -E 'SSSE3|AVX2|GFNI' | sort -u)
+              ;;
+            Windows)
+              powershell -NoProfile -Command "(Get-CimInstance Win32_Processor).Name"
+              ;;
+          esac
+          cargo test -p paperback-rs --locked --lib simd -- --nocapture --test-threads=1 2>&1 | tee vector.log
+          cargo test -p paperback-rs --locked --lib decoder_speed -- --ignored --nocapture 2>&1 | tee -a vector.log
+          {
+            echo "### Vector code on ${{ matrix.os }}"
+            echo '```'
+            grep -E 'model name|features:|levels tried|^level |in use|any errors' vector.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   audit:
     name: dependency advisories

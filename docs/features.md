@@ -42,6 +42,8 @@ Described from the user's point of view.
   reports a match. `--require-hash` turns a missing or non-matching hash into an error (exit 3). Pictures of one sheet are matched by their identifier as well as by block addresses. `--json` lists `integrity`, the sheet identifiers and `misplaced_blocks`.
 - Pages written by paperback.rs tell their layout, so a block read in a cell where it does not belong is dropped
   instead of trusted (`-v` counts them).
+- `--threads N` sets how many threads read the blocks that do not read at once (default: all; 1 is one after the other); the same
+  blocks are read either way.
 - Pages that cannot be read are reported with `-v` and skipped; the file is restored if the
   remaining pages carry everything.
 - If blocks are missing, the error lists the pages to scan again.

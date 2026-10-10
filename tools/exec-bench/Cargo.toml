@@ -1,0 +1,16 @@
+# Compares ways of running batches of CPU-bound tasks on several threads, the shape of work the
+# decoder has when it tries many ways of reading one block. Not part of the workspace and not
+# shipped: `cargo run --release` in this folder prints the times.
+[package]
+name = "exec-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+rayon = "1.10"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+smol = "2"
+futures-lite = "2"
