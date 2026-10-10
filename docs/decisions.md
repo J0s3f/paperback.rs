@@ -33,7 +33,8 @@ names, so the name `at.j0s.paperback` is not used; the domain appears as homepag
 ## Encryption is for compatibility, not a recommendation
 
 The crypto code is the original's scheme built from RustCrypto crates and is not audited; it has no authentication
-beyond a 16-bit checksum. It exists so that old encrypted pages stay readable and new ones can be read by the original.
+beyond a 16-bit checksum (pages of paperback.rs 1.2 and later carry a keyed check value as well, see
+"Extension records"; it protects only if the reader requires it with `--require-hash`). It exists so that old encrypted pages stay readable and new ones can be read by the original.
 The README recommends encrypting with an audited tool first (age, Picocrypt and others, with their audit status as
 found in October 2026) and using paperback.rs only to encode the result.
 
@@ -309,5 +310,11 @@ agree with the layout (the same vote as for combining pictures, `decode/sheet.rs
 changes nothing.
 
 Not done: a map of cells to addresses used to read *less* (skip blocks) or *more* (aim the effort at cells that must
-hold data), authenticated encryption (a MAC could be stripped from the pages unless readers insist on it), a second
+hold data), a second
 recovery layer.
+
+Authenticated encryption, as far as it goes: the check value of an encrypted file is an HMAC-SHA256, so damage and a
+wrong password are always caught when the value is on the pages. It cannot defend against someone who can change the pages:
+the record, the mode bit and the label are not themselves authenticated, so a changed page set with the value taken off
+reads as a page set of the original programs. `decode --require-hash` closes that: it refuses a file without a matching
+value. It is an option because pages of the original programs, and pages made with `--no-extensions`, have none.

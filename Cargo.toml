@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/paperback-rs", "crates/paperback-rs-cli"]
 
 [workspace.package]
-version = "1.2.0"
+version = "1.2.1"
 edition = "2024"
 license = "GPL-3.0-or-later"
 homepage = "https://paperback.j0s.at"

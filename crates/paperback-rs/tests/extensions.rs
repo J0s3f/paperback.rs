@@ -119,6 +119,29 @@ fn a_page_with_extensions_costs_no_data_blocks() {
 }
 
 #[test]
+fn a_hash_can_be_required_and_pages_without_one_are_then_refused() {
+    let data = sample(3000);
+    let strict = DecodeOptions {
+        require_hash: true,
+        ..DecodeOptions::default()
+    };
+    let with = rasters(&data, &options(true));
+    assert_eq!(decode(&with, &strict, |_| {}).unwrap().data, data);
+    // Pages whose hash was never written look like pages whose hash was taken off.
+    let without = rasters(&data, &options(false));
+    assert!(matches!(
+        decode(&without, &strict, |_| {}),
+        Err(paperback_rs::Error::NotVerified)
+    ));
+    assert_eq!(
+        decode(&without, &DecodeOptions::default(), |_| {})
+            .unwrap()
+            .data,
+        data
+    );
+}
+
+#[test]
 fn an_encrypted_file_is_checked_with_the_password() {
     let data = sample(3000);
     let encrypting = EncodeOptions {

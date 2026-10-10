@@ -39,7 +39,7 @@ Described from the user's point of view.
   is pure black and white, stretched contrast or bright halos from sharpening. `--json` lists them as `hints`. Without
   `-v` or `--json` nothing is analysed and nothing is printed.
 - When the pages carry a SHA-256 the restored file is compared with it; a difference is an error (exit 3) and `-v`
-  reports a match. Pictures of one sheet are matched by their identifier as well as by block addresses. `--json` lists `integrity`, the sheet identifiers and `misplaced_blocks`.
+  reports a match. `--require-hash` turns a missing or non-matching hash into an error (exit 3). Pictures of one sheet are matched by their identifier as well as by block addresses. `--json` lists `integrity`, the sheet identifiers and `misplaced_blocks`.
 - Pages written by paperback.rs tell their layout, so a block read in a cell where it does not belong is dropped
   instead of trusted (`-v` counts them).
 - Pages that cannot be read are reported with `-v` and skipped; the file is restored if the

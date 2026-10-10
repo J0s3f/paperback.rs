@@ -136,8 +136,14 @@ What it is, so you can judge:
 - PaperBack 1.10 scheme: PBKDF2-HMAC-SHA256 (524288 rounds, random salt) to derive an AES-192 key, AES-CBC.
   The primitives come from the RustCrypto crates (`aes`, `cbc`, `pbkdf2`, `hmac`, `sha2`); the way they are
   combined is the original's design.
-- There is **no authentication**: nothing detects tampering with the pages except a 16-bit checksum, which also
-  serves as the only "wrong password" check.
+- **Authentication only if you ask for it.** Pages from paperback.rs 1.2 and later carry a check value of the file
+  under a key derived from the password (HMAC-SHA256), and `decode` refuses a file that does not match it, so damage
+  and a wrong password are caught. But the check value is part of the pages, and whoever can change the pages can
+  take it off as well; the file then still decrypts, with only the original's 16-bit checksum to notice, and AES-CBC
+  lets an attacker flip chosen bits of the file. So against an attacker, decode with `--require-hash`: it fails unless
+  the pages carry a check value that the restored file matches. Pages of the original programs, and pages written with
+  `--no-extensions`, carry none and cannot be read that way. Without `--require-hash` the 16-bit checksum is the
+  only protection a page without a check value has, and it is also the only "wrong password" check for them.
 - PaperBack 1.00 scheme (AES-256 in ECB mode keyed with the bare password): **decryption only**, so old
   backups stay readable. It is weak and paperback.rs will never write it.
 

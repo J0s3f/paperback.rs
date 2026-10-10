@@ -23,6 +23,7 @@ pub(crate) fn run(args: &DecodeArgs) -> Result<()> {
         password: password::read(&args.password)?,
         quality: reports.wanted(),
         diagnose: args.verbose || args.json,
+        require_hash: args.require_hash,
     };
     let restored = decode(&pages, &options, |outcome| {
         if args.verbose {

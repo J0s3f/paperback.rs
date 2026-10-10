@@ -711,6 +711,10 @@ pub struct DecodeOptions {
     /// Look at pages that read badly for likely causes (see [`PageStatistics::hints`]); costs a
     /// pass over the pixels of each such page.
     pub diagnose: bool,
+    /// Refuse a file that the pages do not vouch for: without this, pages that carry no hash (or
+    /// had it stripped) are accepted, which is how pages of the original programs read. Needed to
+    /// notice that someone removed the hash from encrypted pages and changed them.
+    pub require_hash: bool,
 }
 
 /// Decodes the given pages (in any order) into the original file. Unreadable
@@ -758,7 +762,11 @@ pub fn decode(
             }),
         }
     }
-    assembler.finish(options.password.as_deref())
+    let restored = assembler.finish(options.password.as_deref())?;
+    if options.require_hash && restored.report.integrity != crate::Integrity::Verified {
+        return Err(Error::NotVerified);
+    }
+    Ok(restored)
 }
 
 #[cfg(test)]
@@ -810,6 +818,10 @@ mod tests {
 
     /// A page of the small file, and the page geometry to find its cells.
     fn small_page() -> (Vec<u8>, Raster, PageLayout, usize) {
+        small_page_with(None)
+    }
+
+    fn small_page_with(password: Option<&str>) -> (Vec<u8>, Raster, PageLayout, usize) {
         let data: Vec<u8> = (0..FILE_LEN).map(|i| (i * 131 + i / 3) as u8).collect();
         let options = EncodeOptions {
             setup: PageSetup {
@@ -818,6 +830,7 @@ mod tests {
                 ..PageSetup::default()
             },
             compression: Compression::None,
+            password: password.map(str::to_owned),
             ..EncodeOptions::default()
         };
         let layout = PageLayout::compute(&options.setup, options.redundancy).unwrap();
@@ -867,6 +880,35 @@ mod tests {
         let file = decode(&[page], &DecodeOptions::default(), |_| {}).unwrap();
         assert_eq!(file.data, data);
         assert_eq!(file.report.integrity, crate::Integrity::Verified);
+    }
+
+    #[test]
+    fn an_encrypted_page_without_its_records_decrypts_unless_a_hash_is_required() {
+        use crate::plan::RECORD_CELLS_PER_END;
+        let (data, raster, layout, rows) = small_page_with(Some("hunter2"));
+        let last = layout.nx * rows - 1;
+        let both_ends: Vec<usize> = (0..RECORD_CELLS_PER_END)
+            .chain(last + 1 - RECORD_CELLS_PER_END..=last)
+            .collect();
+        let stripped = wiped(raster, &layout, &both_ends);
+        let open = DecodeOptions {
+            password: Some("hunter2".into()),
+            ..DecodeOptions::default()
+        };
+        assert_eq!(
+            decode(std::slice::from_ref(&stripped), &open, |_| {})
+                .unwrap()
+                .data,
+            data
+        );
+        let strict = DecodeOptions {
+            require_hash: true,
+            ..open
+        };
+        assert!(matches!(
+            decode(&[stripped], &strict, |_| {}),
+            Err(Error::NotVerified)
+        ));
     }
 
     #[test]

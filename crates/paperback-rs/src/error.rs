@@ -45,6 +45,9 @@ pub enum Error {
     #[error("the restored file does not match the SHA-256 stored on the pages")]
     /// The pages carry a hash of the file and the restored file differs from it.
     HashMismatch,
+    #[error("the pages do not carry a hash that the restored file matches, which was required")]
+    /// A hash was required and the pages show none that was checked.
+    NotVerified,
     #[error("no page carries a readable label")]
     /// No page carries a readable label.
     NoReadablePage,

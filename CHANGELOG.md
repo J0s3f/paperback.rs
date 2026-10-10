@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.1
+
+- `decode --require-hash` (library: `DecodeOptions::require_hash`) fails unless the pages carry a hash or keyed check value
+  that the restored file matches. Without it pages whose check value was taken off are still read, so the README no longer
+  suggests that encrypted pages are protected against tampering by default.
+
 ## 1.2.0
 
 - Pages carry a SHA-256 of the file and an identifier and layout for each sheet, in records that PaperBack 1.00 and

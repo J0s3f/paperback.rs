@@ -145,6 +145,12 @@ pub(crate) struct DecodeArgs {
     #[arg(long, value_name = "PNG")]
     pub(crate) quality_overlay: Option<String>,
 
+    /// Fail unless the pages carry a hash (or, for encrypted files, a keyed check value) that the
+    /// restored file matches. Pages from PaperBack 1.00 and 1.10 and from `--no-extensions` have
+    /// none. Without this, someone who can change the pages can also take the hash off them.
+    #[arg(long)]
+    pub(crate) require_hash: bool,
+
     #[command(flatten)]
     pub(crate) password: PasswordArgs,
 }
