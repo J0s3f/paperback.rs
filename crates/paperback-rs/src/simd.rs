@@ -5,11 +5,13 @@
 //! (0x187) on the processor's vector units, chosen when the program runs.
 //!
 //! The only operation is `dst ^= c * src` for a constant `c` and equal-length rows, which is
-//! what the error correction spends most of its time on. Four implementations exist and give the
+//! what the error correction spends most of its time on. Five implementations exist and give the
 //! same result byte for byte:
 //!
 //! * [`Level::Scalar`]: two table lookups per byte; the reference, and the only one on
 //!   processors that have none of the others;
+//! * [`Level::Neon`]: the same lookups as `vqtbl1q_u8` table lookups, 16 bytes at a time, on
+//!   64-bit ARM, where NEON is part of every processor;
 //! * [`Level::Ssse3`]: the same lookups as `pshufb` shuffles, 16 bytes at a time;
 //! * [`Level::Avx2`]: 32 bytes at a time;
 //! * [`Level::Gfni`]: one `gf2p8affineqb` per 32 bytes, which multiplies by a constant of any
@@ -30,11 +32,14 @@
 
 use std::sync::OnceLock;
 
-/// What the processor can do for the multiplications, from least to most.
+/// What the processor can do for the multiplications. On one processor the levels it offers are
+/// ordered from least to most; the vector levels of ARM and of x86-64 never meet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
     /// Plain code.
     Scalar,
+    /// 128-bit table lookups (64-bit ARM: NEON).
+    Neon,
     /// 128-bit shuffles (x86-64: SSSE3).
     Ssse3,
     /// 256-bit shuffles (x86-64: AVX2).
@@ -44,54 +49,72 @@ pub enum Level {
 }
 
 impl Level {
+    const ALL: [Self; 5] = [
+        Self::Scalar,
+        Self::Neon,
+        Self::Ssse3,
+        Self::Avx2,
+        Self::Gfni,
+    ];
+
     /// The name the environment variable and the diagnostics use.
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
             Self::Scalar => "scalar",
+            Self::Neon => "neon",
             Self::Ssse3 => "ssse3",
             Self::Avx2 => "avx2",
             Self::Gfni => "gfni",
         }
     }
 
+    /// Whether this processor can run the level.
+    #[must_use]
+    pub fn is_available(self) -> bool {
+        match self {
+            Self::Scalar => true,
+            // NEON is part of every 64-bit ARM processor.
+            Self::Neon => cfg!(target_arch = "aarch64"),
+            #[cfg(target_arch = "x86_64")]
+            Self::Ssse3 => is_x86_feature_detected!("ssse3"),
+            #[cfg(target_arch = "x86_64")]
+            Self::Avx2 => is_x86_feature_detected!("avx2"),
+            #[cfg(target_arch = "x86_64")]
+            Self::Gfni => is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2"),
+            #[cfg(not(target_arch = "x86_64"))]
+            Self::Ssse3 | Self::Avx2 | Self::Gfni => false,
+        }
+    }
+
     /// The best level this processor offers.
     #[must_use]
     pub fn best_available() -> Self {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
-                return Self::Gfni;
-            }
-            if is_x86_feature_detected!("avx2") {
-                return Self::Avx2;
-            }
-            if is_x86_feature_detected!("ssse3") {
-                return Self::Ssse3;
-            }
-        }
-        Self::Scalar
+        Self::ALL
+            .into_iter()
+            .rev()
+            .find(|level| level.is_available())
+            .unwrap_or(Self::Scalar)
     }
 
     /// Every level this processor can run, lowest first.
     #[must_use]
     pub fn all_available() -> Vec<Self> {
-        let best = Self::best_available();
-        [Self::Scalar, Self::Ssse3, Self::Avx2, Self::Gfni]
+        Self::ALL
             .into_iter()
-            .filter(|&level| level <= best)
+            .filter(|level| level.is_available())
             .collect()
     }
 
     fn from_name(name: &str) -> Option<Self> {
-        [Self::Scalar, Self::Ssse3, Self::Avx2, Self::Gfni]
+        Self::ALL
             .into_iter()
             .find(|level| level.name().eq_ignore_ascii_case(name.trim()))
     }
 }
 
-/// The level in use: the best available, or the one asked for in `PAPERBACK_SIMD` if that is
-/// lower.
+/// The level in use: the best available, or the one asked for in `PAPERBACK_SIMD` if the
+/// processor has it.
 #[must_use]
 pub fn level() -> Level {
     static LEVEL: OnceLock<Level> = OnceLock::new();
@@ -104,7 +127,8 @@ pub fn level() -> Level {
         std::env::var("PAPERBACK_SIMD")
             .ok()
             .and_then(|name| Level::from_name(&name))
-            .map_or(best, |asked| asked.min(best))
+            .filter(|asked| asked.is_available())
+            .unwrap_or(best)
     })
 }
 
@@ -139,6 +163,10 @@ pub(crate) struct Scale {
     /// The 8 x 8 bit matrix of multiplying by the constant, as `gf2p8affineqb` wants it: byte
     /// `7 - i` of the 64 bits is the row that makes bit `i` of the product, and bit `j` of a
     /// row selects bit `j` of the byte multiplied.
+    #[cfg_attr(
+        not(target_arch = "x86_64"),
+        allow(dead_code, reason = "only the GFNI kernel reads it")
+    )]
     matrix: u64,
 }
 
@@ -190,6 +218,8 @@ fn kernel_for(level: Level) -> Kernel {
         Level::Gfni if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") => {
             x86::gfni
         }
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => arm::neon,
         _ => |_, _, _| 0,
     }
 }
@@ -232,6 +262,38 @@ fn xor_scaled_by(kernel: Kernel, dst: &mut [u8], constant: u8, src: &[u8]) {
     // What the vector code left over, and everything for processors without it.
     for (d, &s) in dst[done..].iter_mut().zip(&src[done..]) {
         *d ^= scale.times(s);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+mod arm {
+    use std::arch::aarch64::{
+        vandq_u8, vdupq_n_u8, veorq_u8, vld1q_u8, vqtbl1q_u8, vshrq_n_u8, vst1q_u8,
+    };
+
+    use super::Scale;
+
+    /// 16 bytes at a time through two table lookups per vector; returns the bytes done.
+    pub(super) fn neon(dst: &mut [u8], scale: &Scale, src: &[u8]) -> usize {
+        let chunks = src.len() / 16;
+        // SAFETY: NEON is part of every 64-bit ARM processor. The tables are 16 bytes, and every
+        // access is inside the first `chunks * 16` bytes of `src` and `dst`, which the caller
+        // gave the same length.
+        unsafe {
+            let lo = vld1q_u8(scale.lo.as_ptr());
+            let hi = vld1q_u8(scale.hi.as_ptr());
+            let low_nibbles = vdupq_n_u8(0x0F);
+            for chunk in 0..chunks {
+                let at = chunk * 16;
+                let bytes = vld1q_u8(src.as_ptr().add(at));
+                let low = vandq_u8(bytes, low_nibbles);
+                let high = vshrq_n_u8::<4>(bytes);
+                let product = veorq_u8(vqtbl1q_u8(lo, low), vqtbl1q_u8(hi, high));
+                let target = dst.as_mut_ptr().add(at);
+                vst1q_u8(target, veorq_u8(vld1q_u8(target), product));
+            }
+        }
+        chunks * 16
     }
 }
 
@@ -441,7 +503,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_level_asked_for_never_exceeds_the_processor() {
-        assert!(level() <= Level::best_available());
+        assert!(level().is_available());
         assert_eq!(Level::from_name(" AVX2 "), Some(Level::Avx2));
         assert_eq!(Level::from_name("nonsense"), None);
         assert_eq!(Level::all_available().first(), Some(&Level::Scalar));
