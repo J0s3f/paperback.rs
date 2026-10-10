@@ -35,6 +35,26 @@ jobs:
       # not needed.
       - name: Test
         run: cargo test --workspace --locked
+      # The error correction has vector code for the processors that have it; its tests try every
+      # level the runner's processor offers. This step shows which: the line "levels tried" lists
+      # them (a runner with GFNI tests that path), and the speed of each follows.
+      - name: Vector code tested on this runner
+        shell: bash
+        run: |
+          set -o pipefail
+          if [ "$RUNNER_OS" = Linux ]; then
+            grep -m1 'model name' /proc/cpuinfo || true
+            echo "features:" $(grep -m1 '^flags' /proc/cpuinfo | tr ' ' '
+' | grep -E '^(ssse3|avx2|gfni|avx512f)$' | sort -u)
+          fi
+          cargo test -p paperback-rs --locked --lib simd -- --nocapture --test-threads=1 2>&1 | tee vector.log
+          cargo test -p paperback-rs --locked --lib decoder_speed -- --ignored --nocapture 2>&1 | tee -a vector.log
+          {
+            echo "### Vector code on ${{ matrix.os }}"
+            echo '```'
+            grep -E 'model name|features:|levels tried|^level |in use|any errors' vector.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   audit:
     name: dependency advisories
