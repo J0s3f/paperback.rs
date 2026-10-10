@@ -410,3 +410,17 @@ The reads of the cells of a page are independent in principle, but the reader le
 worked last, the shifts of the neighbours that later reads start from), so reading them in parallel would change which variant
 succeeds first in marginal cases and with it the blocks read; the search windows of the corner search are independent and could
 be spread over threads with the same results.
+
+### Caches of what failed
+
+Counting showed how much of the work repeats: about half of the words handed to the Reed-Solomon decoder had been tried before
+(13 to 18% within one reading of a block, a third more from other cuts of the same block), and about a quarter of the sampled
+grids that reach the threshold reading at the normal or deep effort were identical to a grid that had failed already. Cuts of a
+block that is read again and again, with shifts of a fraction of a pixel, come out the same. The reader now keeps a 64-bit
+fingerprint of each grid that no variant could read and of each word that did not decode, and skips what it has seen fail. This
+is exact: the threshold reading is a function of the grid and the effort (at the quick effort the variants tried depend on the one
+that worked last, so grids are remembered only at the normal and deep effort, apart from each other), and decoding is a function
+of the word. The fingerprint is not made to resist someone who wants two grids to collide, which would at most make the reader
+skip a block that another attempt reads. About 6% faster on `bent20.png` (25.7, 27.1 and 26.0 seconds before; 24.5, 25.4 and 24.3
+after), the same blocks on every picture of the set. Whole cut-outs repeat much less (10 to 19%) and only at one effort level, so
+skipping them was not done.

@@ -5,6 +5,7 @@
 //! Reads blocks out of a located grid: resampling, sharpening, dot sampling
 //! and error correction.
 
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use super::bitmap::Bitmap;
@@ -112,6 +113,12 @@ pub(crate) struct BlockReader<'a> {
     rows: usize,
     orientation: Option<usize>,
     last_good_variant: usize,
+    /// Fingerprints of the sampled grids that [`BlockReader::recognise_by_threshold`] found no block
+    /// in, by every variant it has; a grid seen again would fail again. Many cuts of a block that
+    /// is read again and again come out the same.
+    failed_grids: HashSet<u64>,
+    /// Fingerprints of the words that did not decode, whichever grid or variant they came from.
+    failed_words: HashSet<u64>,
     /// Where each readable block really sat compared with the fitted grid, in pixels.
     /// Crumpled paper bends the grid; a block sits near where its neighbours were.
     shifts: Vec<Option<(f64, f64)>>,
@@ -177,6 +184,8 @@ impl<'a> BlockReader<'a> {
             rows,
             orientation: None,
             last_good_variant: 0,
+            failed_grids: HashSet::new(),
+            failed_words: HashSet::new(),
             shifts: vec![None; columns * rows],
             tilts: vec![None; columns * rows],
             page_angles: (grid.x_angle, grid.y_angle),
@@ -1038,12 +1047,23 @@ impl<'a> BlockReader<'a> {
     /// threshold variants, starting with the one that worked last.
     #[cfg_attr(feature = "profile", inline(never))]
     fn recognise_by_threshold(&mut self, grid: &DotGrid) -> Option<(RawBlock, usize)> {
+        // With the quick effort the variants tried depend on the one that worked last, so a
+        // failure says little about a later try; with more effort every variant is tried.
+        let grid_key = (self.effort >= Effort::Normal).then(|| {
+            fingerprint(grid.as_flattened())
+                ^ if self.effort == Effort::Deep {
+                    DEEP_TAG
+                } else {
+                    0
+                }
+        });
+        if grid_key.is_some_and(|key| self.failed_grids.contains(&key)) {
+            return None;
+        }
         // The neighbour correction does not depend on the orientation or on whether the limit is
         // taken per quadrant, so each variant needs it once per grid.
         let mut corrected_grids: [Option<Corrected>; THRESHOLD_VARIANTS] =
             std::array::from_fn(|_| None);
-        // Words that did not decode: a variant that reads the same dots gives the same word.
-        let mut failed: Vec<RawBlock> = Vec::new();
         for orientation in 0..ORIENTATIONS {
             if self.orientation.is_some_and(|known| known != orientation) {
                 continue;
@@ -1080,12 +1100,14 @@ impl<'a> BlockReader<'a> {
                 if attempt == 0 && !local {
                     doubtful = Some((block.clone(), certainty_of(adjusted, &limits, map)));
                 }
-                if failed.contains(&block) {
+                // A word that did not decode does not decode when another variant or another cut
+                // gives it again.
+                let word = fingerprint(&block.0);
+                if self.failed_words.contains(&word) {
                     continue;
                 }
-                let as_read = block.clone();
                 let Some(corrected) = block.correct_up_to(MAX_CORRECTIONS) else {
-                    failed.push(as_read);
+                    self.failed_words.insert(word);
                     continue;
                 };
                 if block_crc_matches(&block) {
@@ -1093,7 +1115,7 @@ impl<'a> BlockReader<'a> {
                     self.last_good_variant = variant;
                     return Some((block, corrected));
                 }
-                failed.push(as_read);
+                self.failed_words.insert(word);
             }
             // Nothing read as it is: treat the bytes whose dots were hardest to tell apart
             // as erased, which doubles what the error correction can repair.
@@ -1104,6 +1126,9 @@ impl<'a> BlockReader<'a> {
                 self.orientation = Some(orientation);
                 return Some(found);
             }
+        }
+        if let Some(key) = grid_key {
+            self.failed_grids.insert(key);
         }
         None
     }
@@ -1118,6 +1143,24 @@ impl<'a> BlockReader<'a> {
         };
         (weight, shift)
     }
+}
+
+/// Set in the fingerprint of a grid read with the deepest effort, which tries more.
+const DEEP_TAG: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// A 64-bit fingerprint of some bytes, to tell sampled grids and decoded words apart; it is not
+/// meant to resist anyone who tries to make two collide.
+fn fingerprint(bytes: &[u8]) -> u64 {
+    const MULTIPLIER: u64 = 0x517c_c1b7_2722_0a95;
+    let (words, rest) = bytes.as_chunks::<8>();
+    let mut hash = bytes.len() as u64;
+    for word in words {
+        hash = (hash.rotate_left(5) ^ u64::from_le_bytes(*word)).wrapping_mul(MULTIPLIER);
+    }
+    for &byte in rest {
+        hash = (hash.rotate_left(5) ^ u64::from(byte)).wrapping_mul(MULTIPLIER);
+    }
+    hash ^ (hash >> 29)
 }
 
 struct BlockFit {
