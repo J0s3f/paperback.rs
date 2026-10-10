@@ -197,6 +197,13 @@ and 1.10 programs, which run in CI without the original executables, and `tools/
 that drive the original programs through their file dialogs to check both directions on demand (they never
 print or scan).
 
+## Speed on newer processors
+
+The error correction runs on the vector units of the processor when it has them: SSSE3, AVX2, or GFNI with AVX2 on x86-64,
+chosen when the program starts; a processor with none of them runs the plain code, which gives the same result. `decode -v`
+says which is used. To compare, `PAPERBACK_SIMD=scalar` (or `ssse3`, `avx2`, `gfni`) asks for a lower level; a level the
+processor lacks is never used.
+
 ## Extras that the original does not have
 
 Pages written by paperback.rs carry a SHA-256 of the file and an identifier and layout for each sheet. The originals

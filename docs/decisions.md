@@ -348,31 +348,39 @@ Tried and dropped: a small search window first for the corners (it was about 10%
 on some pictures and down on `bent20`, below its guard); the order of the results of the corner search is kept exactly,
 including ties.
 
-### Vectorisation, and what would be needed
+### Vector code for the error correction
 
-The remaining time is in the same four places. What was found about vectorising them (sources: the Reed-Solomon and
-SIMD literature, and the PAR2 code of nzbfast, GPL-3.0, read for ideas only, no code taken):
+`simd.rs` is the only module with `unsafe` code (the workspace lint is `deny`, the module allows it, and every block says why
+it is sound; `undocumented_unsafe_blocks` is denied). It multiplies rows of bytes in GF(256) with the field polynomial of the
+format (`dst ^= constant * src`) in four ways that give the same bytes: plain table lookups; `pshufb` with two 16-entry nibble
+tables (SSSE3, 16 bytes at a time; AVX2, 32 bytes); and `gf2p8affineqb` with the 8 x 8 bit matrix of the constant (GFNI with
+AVX2), which takes any field polynomial, unlike `gf2p8mulb`, which is fixed to the one of AES. The level is the best the processor
+offers at the first use, found with `is_x86_feature_detected!`, and the kernel for it is stored once in a function pointer, so a
+multiplication costs an indirect jump and no check of the processor. A vector kernel is handed out only after its feature was
+seen, which is what makes the safe wrappers around the `unsafe` functions sound. `PAPERBACK_SIMD` asks for a lower level;
+`decode -v` prints the one in use. Processors on which the cores differ (big.LITTLE) are fine as long as the instruction set the
+program sees is the same on all cores, which is so for the Intel hybrid processors (AVX-512, where they differ, is not used) and
+for ARM under Linux (it reports the common set); this was reasoned, not tried on such hardware, and ARM has no vector kernel here
+anyway: it runs the plain code.
 
-- **Reed-Solomon over GF(256)** is the largest. A call on a word that is not a codeword takes about 5.2 microseconds
-  (`cargo test --release -- --ignored --nocapture decoder_speed`). Multiplying a vector by a constant is what SIMD does well:
-  split each byte into nibbles and use two 16-entry tables with `pshufb` (SSSE3, AVX2), or one `gf2p8affineqb` with the 8 x 8
-  bit matrix of the constant (GFNI, which takes any field polynomial, unlike `gf2p8mulb`, which is fixed to the one of AES).
-  That fits the search for roots of the locator polynomial (one coefficient times a fixed row of powers, 17 rows of 255
-  bytes) and the update step of Berlekamp-Massey. It does not fit the syndromes directly: each root needs another constant,
-  and the matrix of `gf2p8affineqb` is shared by 8 bytes. Syndromes need either `gf2p8mulb` with a change of basis to
-  the AES field, or a batch of candidate words side by side. By estimate a full GFNI decoder would cost about a fifth of the
-  present time per call; with `pshufb` only, about a third.
-- **Cutting out and sharpening** are plain loops over bytes that the compiler vectorises when they have no branches. Building
-  with AVX2 enabled gave 212 to 195 seconds (about 8%) with identical results, so part of the gain is there for the asking, for
-  builds that need an AVX2 processor.
-- **The corner search** is bilinear sampling at places that differ from a candidate to the next by whole pixels; the
-  weights are shared now. Further gains would need another method: separable filters on a straightened picture (box filters
-  along rows and columns, constant cost per pixel whatever the length of the arm), which is not the same measure and so would
-  change what is read.
+The Reed-Solomon decoder was rebuilt around it (`reed_solomon.rs`), and the original routine is kept in the tests as the
+oracle: random words with errors and erasures are decoded by both, at every level the processor has, and must agree on the result
+and on the corrected bytes.
 
-What stands in the way: the project forbids `unsafe`, and intrinsics are reached through `unsafe` calls behind a run-time check
-of the processor's features (`is_x86_feature_detected!`; since Rust 1.87 the intrinsics themselves are safe inside a function
-with the matching `target_feature`, but calling such a function is not). Options are one small module with `unsafe` and a
-documented reason, a crate that contains the unsafe part (archmage, fearless_simd, multiversion), or build variants for
-AVX2 and later processors. The GFNI path cannot be tested on the machine used for development (AMD Zen 3, which has AVX2 but
-no GFNI), so it would need a test runner that has it.
+- The syndromes come from the remainder of the word divided by the generator polynomial (the shift register of the encoder, with
+  a table of multiples of the generator, on four 64-bit words), evaluated at the roots with table rows chosen by its bytes. This
+  needs no vector instructions and runs for every processor: 1.8 microseconds became 0.3.
+- Berlekamp-Massey keeps its polynomials as they are, not as logarithms, so that the update is one multiplication of a row by a
+  constant; the search for the roots of the locator polynomial adds up rows of powers times its coefficients.
+- A call on a word that is not a codeword (`cargo test --release -- --ignored --nocapture decoder_speed`): 5.4 microseconds
+  before, 4.1 plain, 2.2 with SSSE3, 2.0 with AVX2. GFNI cannot be run on the machine this was written on (AMD Zen 3: AVX2, no
+  GFNI), so it is tested there against a software model of the instruction (the bit matrices multiply as claimed for every
+  constant) and on another machine with the same tests: `cargo test -p paperback-rs --release --lib simd` shows with
+  `--nocapture` which levels were tried.
+- Eight pictures, seconds: 212 before this step, 176 with AVX2, 197 with the plain code, 450 at the start of the speed work, all with
+  the same blocks read.
+
+What is left that vectors could do: the rest of the time is the corner search (bilinear samples; a different method would be
+needed to vectorise it, which would change what is read), cutting out blocks and sharpening (plain loops the compiler vectorises
+when the build is allowed AVX2: about 8% in an experiment, which the run-time choice cannot give them), and the discrepancy
+step of Berlekamp-Massey (a dot product of two vectors, which would want `gf2p8mulb` and a change of basis to the field of AES).

@@ -25,6 +25,9 @@ pub(crate) fn run(args: &DecodeArgs) -> Result<()> {
         diagnose: args.verbose || args.json,
         require_hash: args.require_hash,
     };
+    if args.verbose {
+        eprintln!("vector code: {}", paperback_rs::simd::level().name());
+    }
     let restored = decode(&pages, &options, |outcome| {
         if args.verbose {
             report_page(&outcome);
@@ -190,6 +193,7 @@ fn summary(restored: &RestoredFile) -> String {
         "misplaced_blocks": report.misplaced_blocks,
         "sheets": report.sheets.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "integrity": integrity_name(report.integrity),
+        "vector_code": paperback_rs::simd::level().name(),
         "hints": report.hints.names(),
     })
     .to_string()
