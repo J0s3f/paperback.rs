@@ -318,3 +318,61 @@ wrong password are always caught when the value is on the pages. It cannot defen
 the record, the mode bit and the label are not themselves authenticated, so a changed page set with the value taken off
 reads as a page set of the original programs. `decode --require-hash` closes that: it refuses a file without a matching
 value. It is an option because pages of the original programs, and pages made with `--no-extensions`, have none.
+
+## Where the decoding time goes, and what was done about it
+
+Decoding a difficult photograph takes minutes because the decoder tries many things for every block that does not read.
+To see where the time goes there are two tools: `tools/profile.ps1` samples the program with the Windows Performance
+Toolkit (administrator rights; `--features profile` stops the compiler from inlining the functions the report has to tell
+apart), and `tools/timing.sh` decodes a fixed set of eight difficult pictures one after the other and prints the seconds
+and the blocks restored, which is also the check that a change did not change what is read. A sampling profile of the first
+state (eight pictures, 480 s of CPU) said:
+
+| Where | Share |
+|---|---|
+| corner search of the mesh (`mesh::refine`, bilinear sampling along the arms of a cross) | 29% |
+| Reed-Solomon decoding (`decode_with_erasures`) | 28% |
+| cutting out, sharpening and reading dots of a block (`read_posed`) | 25% |
+| choosing thresholds and orientations (`recognise`) | 6% |
+
+Changes that give the same blocks on every picture of the set (eight pictures, seconds):
+
+| Step | Seconds |
+|---|---|
+| start (version 1.2.1) | 450 |
+| corner search: start with the centre and drop a place after its horizontal arm when it cannot win, no table of all scores; syndromes by table; stop when the locator polynomial has more roots than can be used; shifted samplings only for blocks that do not read from the first one; neighbour correction once per variant | 342 |
+| cut a block out once for all sharpness levels (it was cut for each level); sharpening without a branch per pixel; roots of the locator polynomial by table rows; syndrome loop bounded by the locator's degree | 250 |
+| corner search: places and interpolation weights of the arms worked out once per search (moving a cross by whole pixels keeps the weights); skip words that failed already | 212 |
+
+Tried and dropped: a small search window first for the corners (it was about 10% faster but changed what was read, up
+on some pictures and down on `bent20`, below its guard); the order of the results of the corner search is kept exactly,
+including ties.
+
+### Vectorisation, and what would be needed
+
+The remaining time is in the same four places. What was found about vectorising them (sources: the Reed-Solomon and
+SIMD literature, and the PAR2 code of nzbfast, GPL-3.0, read for ideas only, no code taken):
+
+- **Reed-Solomon over GF(256)** is the largest. A call on a word that is not a codeword takes about 5.2 microseconds
+  (`cargo test --release -- --ignored --nocapture decoder_speed`). Multiplying a vector by a constant is what SIMD does well:
+  split each byte into nibbles and use two 16-entry tables with `pshufb` (SSSE3, AVX2), or one `gf2p8affineqb` with the 8 x 8
+  bit matrix of the constant (GFNI, which takes any field polynomial, unlike `gf2p8mulb`, which is fixed to the one of AES).
+  That fits the search for roots of the locator polynomial (one coefficient times a fixed row of powers, 17 rows of 255
+  bytes) and the update step of Berlekamp-Massey. It does not fit the syndromes directly: each root needs another constant,
+  and the matrix of `gf2p8affineqb` is shared by 8 bytes. Syndromes need either `gf2p8mulb` with a change of basis to
+  the AES field, or a batch of candidate words side by side. By estimate a full GFNI decoder would cost about a fifth of the
+  present time per call; with `pshufb` only, about a third.
+- **Cutting out and sharpening** are plain loops over bytes that the compiler vectorises when they have no branches. Building
+  with AVX2 enabled gave 212 to 195 seconds (about 8%) with identical results, so part of the gain is there for the asking, for
+  builds that need an AVX2 processor.
+- **The corner search** is bilinear sampling at places that differ from a candidate to the next by whole pixels; the
+  weights are shared now. Further gains would need another method: separable filters on a straightened picture (box filters
+  along rows and columns, constant cost per pixel whatever the length of the arm), which is not the same measure and so would
+  change what is read.
+
+What stands in the way: the project forbids `unsafe`, and intrinsics are reached through `unsafe` calls behind a run-time check
+of the processor's features (`is_x86_feature_detected!`; since Rust 1.87 the intrinsics themselves are safe inside a function
+with the matching `target_feature`, but calling such a function is not). Options are one small module with `unsafe` and a
+documented reason, a crate that contains the unsafe part (archmage, fearless_simd, multiversion), or build variants for
+AVX2 and later processors. The GFNI path cannot be tested on the machine used for development (AMD Zen 3, which has AVX2 but
+no GFNI), so it would need a test runner that has it.

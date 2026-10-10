@@ -1005,6 +1005,8 @@ impl<'a> BlockReader<'a> {
         // taken per quadrant, so each variant needs it once per grid.
         let mut corrected_grids: [Option<Adjusted>; THRESHOLD_VARIANTS] =
             std::array::from_fn(|_| None);
+        // Words that did not decode: a variant that reads the same dots gives the same word.
+        let mut failed: Vec<RawBlock> = Vec::new();
         for orientation in 0..ORIENTATIONS {
             if self.orientation.is_some_and(|known| known != orientation) {
                 continue;
@@ -1050,7 +1052,12 @@ impl<'a> BlockReader<'a> {
                 if attempt == 0 && !local {
                     doubtful = Some((block.clone(), certainty));
                 }
+                if failed.contains(&block) {
+                    continue;
+                }
+                let as_read = block.clone();
                 let Some(corrected) = block.correct_up_to(MAX_CORRECTIONS) else {
+                    failed.push(as_read);
                     continue;
                 };
                 if block_crc_matches(&block) {
@@ -1058,6 +1065,7 @@ impl<'a> BlockReader<'a> {
                     self.last_good_variant = variant;
                     return Some((block, corrected));
                 }
+                failed.push(as_read);
             }
             // Nothing read as it is: treat the bytes whose dots were hardest to tell apart
             // as erased, which doubles what the error correction can repair.

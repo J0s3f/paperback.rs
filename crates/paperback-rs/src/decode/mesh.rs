@@ -640,9 +640,116 @@ fn edge_middle(bitmap: &Bitmap, from: Point, to: Point, step: f64, minimum: f64)
     Some((middle.0 + side.0 * offset, middle.1 + side.1 * offset))
 }
 
+/// A sample taken at a place between pixels: the pixel to its upper left and how far past it
+/// the place lies, for bilinear interpolation.
+#[derive(Clone, Copy)]
+struct Tap {
+    x: isize,
+    y: isize,
+    fx: f64,
+    fy: f64,
+}
+
+impl Tap {
+    fn at((x, y): Point) -> Self {
+        let (x0, y0) = (x.floor(), y.floor());
+        Self {
+            x: x0 as isize,
+            y: y0 as isize,
+            fx: x - x0,
+            fy: y - y0,
+        }
+    }
+}
+
+/// The places along one arm of a cross where a dark line is looked for: the line itself and
+/// the paper on both sides of it, one set per step along the arm. When the cross is moved by
+/// whole pixels the interpolation weights stay the same, so an arm worked out once serves every
+/// place of a search; this takes the cost of working out places and weights out of the search.
+struct Arm {
+    steps: Vec<[Tap; 3]>,
+    /// The extent of the pixels read, to see whether a moved arm stays inside the bitmap.
+    least: (isize, isize),
+    most: (isize, isize),
+}
+
+impl Arm {
+    /// The arm through `point` along `direction`, `side` being across it.
+    fn new(point: Point, direction: Point, side: Point, arm: f64) -> Self {
+        let mut steps = Vec::new();
+        let mut t = -arm;
+        while t <= arm {
+            let on = (point.0 + direction.0 * t, point.1 + direction.1 * t);
+            steps.push([
+                Tap::at(on),
+                Tap::at((on.0 + side.0 * LINE_OFFSET, on.1 + side.1 * LINE_OFFSET)),
+                Tap::at((on.0 - side.0 * LINE_OFFSET, on.1 - side.1 * LINE_OFFSET)),
+            ]);
+            t += 1.0;
+        }
+        let taps = || steps.iter().flatten();
+        let least = (
+            taps().map(|tap| tap.x).min().unwrap_or(0),
+            taps().map(|tap| tap.y).min().unwrap_or(0),
+        );
+        let most = (
+            taps().map(|tap| tap.x).max().unwrap_or(0),
+            taps().map(|tap| tap.y).max().unwrap_or(0),
+        );
+        Self { steps, least, most }
+    }
+
+    /// The contrast of the line when the arm is moved by (`dx`, `dy`) whole pixels: the same
+    /// as [`ridge`] at the moved place. `None` if any sample would be outside the bitmap.
+    fn ridge(&self, bitmap: &Bitmap, dx: isize, dy: isize) -> Option<f64> {
+        let (width, height) = (bitmap.width() as isize, bitmap.height() as isize);
+        if self.least.0 + dx < 0
+            || self.least.1 + dy < 0
+            || self.most.0 + dx + 1 >= width
+            || self.most.1 + dy + 1 >= height
+        {
+            return None;
+        }
+        let read = |tap: &Tap| {
+            let (x, y) = ((tap.x + dx) as usize, (tap.y + dy) as usize);
+            let p = |ox: usize, oy: usize| f64::from(bitmap.at(x + ox, y + oy));
+            let top = p(0, 0) + (p(1, 0) - p(0, 0)) * tap.fx;
+            let bottom = p(0, 1) + (p(1, 1) - p(0, 1)) * tap.fx;
+            top + (bottom - top) * tap.fy
+        };
+        let mut sum = 0.0;
+        for [line, left, right] in &self.steps {
+            sum += f64::midpoint(read(left), read(right)) - read(line);
+        }
+        Some(sum / self.steps.len() as f64)
+    }
+}
+
+/// The two arms of a cross at a place, to be moved over the search window.
+struct Cross {
+    horizontal: Arm,
+    vertical: Arm,
+}
+
+impl Cross {
+    fn new(center: Point, axes: Axes, arm: f64) -> Self {
+        Self {
+            horizontal: Arm::new(center, axes.along_x, axes.along_y, arm),
+            vertical: Arm::new(center, axes.along_y, axes.along_x, arm),
+        }
+    }
+
+    /// How much darker than the paper beside them the lines are when the cross is moved by
+    /// (`dx`, `dy`): the smaller of the contrast of the two arms.
+    fn contrast(&self, bitmap: &Bitmap, dx: isize, dy: isize) -> Option<f64> {
+        let horizontal = self.horizontal.ridge(bitmap, dx, dy)?;
+        let vertical = self.vertical.ridge(bitmap, dx, dy)?;
+        Some(horizontal.min(vertical))
+    }
+}
+
 /// Searches around `center` for the place where a horizontal and a vertical dark line cross.
 /// Returns the place to a fraction of a pixel and the contrast of the lines with the paper.
-#[cfg_attr(feature = "profile", inline(never))]
 fn refine(
     bitmap: &Bitmap,
     center: Point,
@@ -652,25 +759,24 @@ fn refine(
 ) -> Option<(Point, f64)> {
     let arm = (step * ARM_SHARE).max(4.0);
     let reach = radius.ceil() as isize;
-    let at = |dx: isize, dy: isize| (center.0 + dx as f64, center.1 + dy as f64);
+    let cross = Cross::new(center, axes, arm);
     // The best point is the first of the highest scores in the order of rows. The centre
     // usually scores well, so starting with it lets most of the others be dismissed after
     // the horizontal arm alone: the score is the smaller of the two arms.
     let mut best: Option<(isize, isize, f64)> =
-        cross_contrast(bitmap, center, axes, arm).map(|score| (0, 0, score));
+        cross.contrast(bitmap, 0, 0).map(|score| (0, 0, score));
     for dy in -reach..=reach {
         for dx in -reach..=reach {
             if (dx, dy) == (0, 0) {
                 continue;
             }
-            let point = at(dx, dy);
-            let Some(horizontal) = ridge(bitmap, point, axes.along_x, axes.along_y, arm) else {
+            let Some(horizontal) = cross.horizontal.ridge(bitmap, dx, dy) else {
                 continue;
             };
             if best.is_some_and(|(_, _, s)| horizontal < s) {
                 continue;
             }
-            let Some(vertical) = ridge(bitmap, point, axes.along_y, axes.along_x, arm) else {
+            let Some(vertical) = cross.vertical.ridge(bitmap, dx, dy) else {
                 continue;
             };
             let score = horizontal.min(vertical);
@@ -690,7 +796,7 @@ fn refine(
     // Scores next to the best one, where they lie within the search.
     let scores = |dx: isize, dy: isize| {
         (dx.abs() <= reach && dy.abs() <= reach)
-            .then(|| cross_contrast(bitmap, at(dx, dy), axes, arm))
+            .then(|| cross.contrast(bitmap, dx, dy))
             .flatten()
     };
     // The top of a parabola through the best score and its two neighbours, per axis.
@@ -709,15 +815,6 @@ fn refine(
         ),
         score,
     ))
-}
-
-/// How much darker than the paper beside them the lines through `point` are: the smaller
-/// of the contrast of the horizontal and of the vertical arm. `None` outside the picture.
-#[cfg_attr(feature = "profile", inline(never))]
-fn cross_contrast(bitmap: &Bitmap, point: Point, axes: Axes, arm: f64) -> Option<f64> {
-    let horizontal = ridge(bitmap, point, axes.along_x, axes.along_y, arm)?;
-    let vertical = ridge(bitmap, point, axes.along_y, axes.along_x, arm)?;
-    Some(horizontal.min(vertical))
 }
 
 /// The contrast of a dark line through `point` along `direction` (`side` is across it),

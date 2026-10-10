@@ -426,4 +426,49 @@ mod tests {
         let verdict = decode(&mut damaged, PAD);
         assert!(verdict.is_none_or(|n| n <= 16));
     }
+
+    type Decoder = dyn FnMut(&mut [u8; BLOCK]) -> Option<usize>;
+
+    /// Time per call of the decoder on words that are not codewords, which is what most calls
+    /// are: the page is turned the wrong way or the threshold is wrong. Run with
+    /// `cargo test --release -- --ignored --nocapture decoder_speed`.
+    #[test]
+    #[ignore = "a speed measurement, not a test"]
+    fn decoder_speed() {
+        use std::time::Instant;
+        const CALLS: usize = 200_000;
+        let mut state = 0x1234_5678_u32;
+        let mut random_word = || -> [u8; BLOCK] {
+            std::array::from_fn(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+        };
+        let words: Vec<[u8; BLOCK]> = (0..64).map(|_| random_word()).collect();
+        let erased: Vec<usize> = (0..24).map(|i| i * 5).collect();
+        let time = |what: &str, mut call: Box<Decoder>| {
+            let start = Instant::now();
+            let mut accepted = 0;
+            for n in 0..CALLS {
+                let mut word = words[n % words.len()];
+                accepted += usize::from(call(&mut word).is_some());
+            }
+            let per_call = start.elapsed().as_secs_f64() * 1e9 / CALLS as f64;
+            println!("{what:<34} {per_call:>8.0} ns per call, {accepted} accepted");
+        };
+        time("no erasures, any errors", Box::new(|w| decode(w, PAD)));
+        time(
+            "no erasures, at most 16",
+            Box::new(|w| decode_up_to(w, PAD, 16)),
+        );
+        let e16 = erased[..16].to_vec();
+        time(
+            "16 erasures",
+            Box::new(move |w| decode_with_erasures(w, PAD, &e16)),
+        );
+        time(
+            "24 erasures",
+            Box::new(move |w| decode_with_erasures(w, PAD, &erased)),
+        );
+    }
 }
