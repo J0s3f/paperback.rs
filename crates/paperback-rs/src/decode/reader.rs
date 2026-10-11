@@ -37,6 +37,8 @@ const MAX_POSE_TRIES: usize = 12;
 const NORMAL_POSE_TRIES: usize = 3;
 /// Corners of a block that must be found in the picture before it is read through them.
 const MIN_CORNERS: usize = 3;
+/// All four corners of a block.
+const ALL_CORNERS: usize = 4;
 /// Reach of the averaging around a dot, as a share of the distance between two dots; a
 /// small window keeps the dot sharp, a wider one forgives errors in its place.
 const WARPED_DOT_WINDOWS: [f64; 2] = [0.3, 0.55];
@@ -186,6 +188,12 @@ pub(crate) struct BlockReader<'a> {
     /// Local rotation of each readable block against the page-wide tilt, in the units of
     /// the grid angles. Photographs of bent paper turn blocks by different amounts.
     tilts: Vec<Option<f64>>,
+    /// The outline each readable block was read through: the cut of the straight grid moved to
+    /// the lines the block showed, or the corners of the mesh that read it. The drawing of the
+    /// quality shows each block there, so its colour lies on the block it belongs to. `None`
+    /// unless the quality is drawn (see [`Self::record_outlines`]): every copy of the reader
+    /// that tries a way of reading a block would copy it.
+    read_quads: Option<Vec<Option<Quad>>>,
     page_angles: (f64, f64),
     /// The corners of all blocks, found when the first block needed them; `Some(None)` if there
     /// are no grid lines to follow.
@@ -259,6 +267,7 @@ impl<'a> BlockReader<'a> {
             failed_words: HashSet::new(),
             shifts: vec![None; columns * rows],
             tilts: vec![None; columns * rows],
+            read_quads: None,
             page_angles: (grid.x_angle, grid.y_angle),
             meshes: MESH_TRUSTS.iter().map(|_| MeshState::NotBuilt).collect(),
             threads: 1,
@@ -300,6 +309,13 @@ impl<'a> BlockReader<'a> {
         let shift = self.shifts[row * self.columns + column]?;
         let centre = self.cell_centre(column, row);
         Some((centre.0 + shift.0, centre.1 + shift.1))
+    }
+
+    /// Keeps the outline every block is read through from now on, for drawing the quality.
+    pub(crate) fn record_outlines(&mut self) {
+        if self.read_quads.is_none() {
+            self.read_quads = Some(vec![None; self.columns * self.rows]);
+        }
     }
 
     pub(crate) fn set_effort(&mut self, effort: Effort) {
@@ -542,6 +558,7 @@ impl<'a> BlockReader<'a> {
             failed_words: HashSet::new(),
             shifts: self.shifts.clone(),
             tilts: self.tilts.clone(),
+            read_quads: self.read_quads.clone(),
             page_angles: self.page_angles,
             meshes: self.meshes.clone(),
             threads,
@@ -644,6 +661,9 @@ impl<'a> BlockReader<'a> {
         let at = row * self.columns + column;
         self.shifts[at] = worker.shifts[at];
         self.tilts[at] = worker.tilts[at];
+        if let (Some(quads), Some(learned)) = (&mut self.read_quads, &worker.read_quads) {
+            quads[at] = learned[at];
+        }
         self.orientation = worker.orientation;
         self.last_good_variant = worker.last_good_variant;
         if self.recording {
@@ -656,15 +676,28 @@ impl<'a> BlockReader<'a> {
         }
     }
 
-    /// The four corners of every block, row by row from the top, for drawing the page; follows
-    /// the grid lines across the page if that has not been done yet.
+    /// The four corners of every block, row by row from the top, for drawing the page: a block
+    /// that was read where it was read, one that was not between the corners of the blocks
+    /// around it that were, and any other where the first mesh follows the grid lines (built now
+    /// if that has not been done yet). The mesh alone would put blocks read another way where
+    /// its lines went, and on crumpled paper they can go astray by a good part of a block while
+    /// the blocks themselves were read from their own lines.
     pub(crate) fn cell_quads(&mut self) -> Option<Vec<Quad>> {
         let (columns, rows) = (self.columns, self.rows);
+        let read_quads = self
+            .read_quads
+            .as_ref()
+            .map(|read| between_read_neighbours(read, columns, rows));
         let mesh = self.mesh(0)?;
         Some(
             (0..rows)
                 .flat_map(|row| (0..columns).map(move |column| (column, row)))
-                .map(|(column, row)| mesh.quad(column, rows - 1 - row))
+                .map(|(column, row)| {
+                    read_quads
+                        .as_ref()
+                        .and_then(|quads| quads[row * columns + column])
+                        .unwrap_or_else(|| mesh.quad(column, rows - 1 - row))
+                })
                 .collect(),
         )
     }
@@ -711,6 +744,9 @@ impl<'a> BlockReader<'a> {
                 let middle = quad.at(0.5, 0.5);
                 self.shifts[row * self.columns + column] =
                     Some((middle.0 - ideal_middle.0, middle.1 - ideal_middle.1));
+                if let Some(quads) = &mut self.read_quads {
+                    quads[row * self.columns + column] = Some(quad);
+                }
                 return Some(found);
             }
         }
@@ -1037,6 +1073,12 @@ impl<'a> BlockReader<'a> {
                     let at = row * self.columns + column;
                     self.shifts[at] = Some(self.real_shift(&fit, shift));
                     self.tilts[at] = Some(tilt);
+                    if self.read_quads.is_some() {
+                        let quad = self.fit_quad(&fit, x0, y0);
+                        if let Some(quads) = &mut self.read_quads {
+                            quads[at] = Some(quad);
+                        }
+                    }
                     outcome = BlockOutcome::Readable { block, corrected };
                     break;
                 }
@@ -1061,6 +1103,30 @@ impl<'a> BlockReader<'a> {
             x_pitch,
             y_pitch,
         }
+    }
+
+    /// The cell whose dots `fit` sampled, in the bitmap: from the grid line before its first
+    /// dot to the next one, each way, carried out of the cut that started at (`x0`, `y0`) the
+    /// way [`Self::resample`] carried the pixels into it.
+    fn fit_quad(&self, fit: &BlockFit, x0: i32, y0: i32) -> Quad {
+        let (x0, y0) = (f64::from(x0), f64::from(y0));
+        let (x_angle, y_angle) = (self.grid.x_angle, self.grid.y_angle);
+        let left = fit.x_origin - 2.0 * fit.x_pitch;
+        let bottom = fit.y_origin - 2.0 * fit.y_pitch;
+        let (right, top) = (
+            left + GRID_CELL_DOTS * fit.x_pitch,
+            bottom + GRID_CELL_DOTS * fit.y_pitch,
+        );
+        let in_bitmap = |i: f64, j: f64| (x0 + i + (y0 + j) * x_angle, y0 + j + (x0 + i) * y_angle);
+        // The lines of the block were located (or, for a guessed cut, the block read where they
+        // were guessed), so its corners count as found.
+        Quad::new(
+            in_bitmap(left, bottom),
+            in_bitmap(right, bottom),
+            in_bitmap(left, top),
+            in_bitmap(right, top),
+            ALL_CORNERS,
+        )
     }
 
     /// How far the block's own grid lines are from where the fitted grid expected
@@ -1554,6 +1620,79 @@ struct BlockFit {
     y_pitch: f64,
 }
 
+/// The outlines of `read` (row by row from the top), with the cells that were not read put
+/// between the blocks around them that were: a corner that read blocks share with the cell is
+/// where they were read (the average where they differ), and a cell with three such corners
+/// takes the fourth where it completes the parallelogram. Cells with fewer stay `None`.
+fn between_read_neighbours(
+    read: &[Option<Quad>],
+    columns: usize,
+    rows: usize,
+) -> Vec<Option<Quad>> {
+    let across = columns + 1;
+    // The crossings of the grid lines at the lower left, lower right, upper left and upper right
+    // of a cell, as (line across, line up).
+    let crossings = |at: usize| {
+        let (column, up) = (at % columns, rows - 1 - at / columns);
+        [
+            (column, up),
+            (column + 1, up),
+            (column, up + 1),
+            (column + 1, up + 1),
+        ]
+    };
+    let mut sums = vec![(0.0, 0.0, 0usize); across * (rows + 1)];
+    for (at, quad) in read.iter().enumerate() {
+        let Some(quad) = quad else {
+            continue;
+        };
+        let corners = [
+            quad.lower_left,
+            quad.lower_right,
+            quad.upper_left,
+            quad.upper_right,
+        ];
+        for ((a, b), corner) in crossings(at).into_iter().zip(corners) {
+            let sum = &mut sums[b * across + a];
+            *sum = (sum.0 + corner.0, sum.1 + corner.1, sum.2 + 1);
+        }
+    }
+    read.iter()
+        .enumerate()
+        .map(|(at, quad)| {
+            if quad.is_some() {
+                return *quad;
+            }
+            let mut corners = crossings(at).map(|(a, b)| {
+                let (x, y, count) = sums[b * across + a];
+                (count > 0).then(|| (x / count as f64, y / count as f64))
+            });
+            let known = corners.iter().flatten().count();
+            if known < MIN_CORNERS {
+                return None;
+            }
+            // Corners are numbered lower left, lower right, upper left, upper right, so the one
+            // opposite corner `i` is `3 - i` and the other two are next to it.
+            if let Some(missing) = corners.iter().position(Option::is_none) {
+                let opposite = corners[3 - missing]?;
+                let (one, two) = match missing {
+                    0 | 3 => (corners[1]?, corners[2]?),
+                    _ => (corners[0]?, corners[3]?),
+                };
+                corners[missing] = Some((one.0 + two.0 - opposite.0, one.1 + two.1 - opposite.1));
+            }
+            let [lower_left, lower_right, upper_left, upper_right] = corners.map(Option::unwrap);
+            Some(Quad::new(
+                lower_left,
+                lower_right,
+                upper_left,
+                upper_right,
+                known,
+            ))
+        })
+        .collect()
+}
+
 /// Half a block; shadows of creases change the paper's brightness from one
 /// quadrant to the next, so each gets its own black/white limit.
 const QUADRANT: usize = BLOCK_DOTS / 2;
@@ -1784,3 +1923,141 @@ fn dispersion(grid: &DotGrid, top: usize, left: usize) -> f64 {
 }
 
 const _: () = assert!(UNREADABLE == MAX_CORRECTIONS + 1);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::Compression;
+    use crate::encode::{EncodeOptions, encode};
+    use crate::layout::{CELL_DOTS, PageLayout, PageSetup};
+    use crate::raster::Raster;
+
+    /// A clean page, with the distance from the top of the picture to the first grid line.
+    fn page() -> (Raster, PageLayout, usize) {
+        let data: Vec<u8> = (0..20_000u32).map(|at| ((at * 7919) >> 3) as u8).collect();
+        let options = EncodeOptions {
+            setup: PageSetup {
+                printer_dpi: 300,
+                dot_dpi: 200,
+                ..PageSetup::default()
+            },
+            compression: Compression::None,
+            ..EncodeOptions::default()
+        };
+        let layout = PageLayout::compute(
+            &options.setup,
+            crate::plan::Strings::new(options.redundancy),
+        )
+        .unwrap();
+        let raster = encode(&data, &options).unwrap().remove(0).raster;
+        let top = layout.text.map_or(0, |text| text.top_band()) + layout.border;
+        (raster, layout, top)
+    }
+
+    #[test]
+    fn a_block_read_through_the_grid_is_drawn_on_the_lines_around_it() {
+        let (raster, layout, top) = page();
+        let bitmap = Bitmap::from_raster(&raster);
+        let (grid, intensity) = super::super::find_grid(&bitmap).unwrap();
+        let mut reader = BlockReader::new(&bitmap, grid, intensity);
+        reader.record_outlines();
+        let (column, row) = (reader.columns() / 2, reader.rows() / 2);
+        assert!(matches!(
+            reader.read(column, row),
+            BlockOutcome::Readable { .. }
+        ));
+        let quad = reader.read_quads.as_ref().unwrap()[row * reader.columns() + column].unwrap();
+        // Every corner on a crossing of the printed lines, which the bitmap counts from the bottom.
+        let near_line = |at: f64, first: usize, step: usize| {
+            let off = (at - first as f64).rem_euclid(step as f64);
+            off.min(step as f64 - off) <= (layout.dx.max(layout.dy) + 1) as f64
+        };
+        let height = raster.height() as f64;
+        for corner in [
+            quad.lower_left,
+            quad.lower_right,
+            quad.upper_left,
+            quad.upper_right,
+        ] {
+            assert!(
+                near_line(corner.0, layout.border, CELL_DOTS * layout.dx),
+                "{corner:?}"
+            );
+            assert!(
+                near_line(height - 1.0 - corner.1, top, CELL_DOTS * layout.dy),
+                "{corner:?}"
+            );
+        }
+        let size = quad.lower_right.0 - quad.lower_left.0;
+        assert!(
+            (size - (CELL_DOTS * layout.dx) as f64).abs() < 1.0,
+            "{size}"
+        );
+    }
+
+    #[test]
+    fn a_block_that_was_read_is_drawn_where_it_was_read_not_where_the_mesh_has_it() {
+        let (raster, _, _) = page();
+        let bitmap = Bitmap::from_raster(&raster);
+        let (grid, intensity) = super::super::find_grid(&bitmap).unwrap();
+        let mut reader = BlockReader::new(&bitmap, grid, intensity);
+        let columns = reader.columns();
+        let rows = reader.rows();
+        let (column, row) = (columns / 2, rows / 2);
+        let elsewhere = Quad::new((1.0, 2.0), (3.0, 4.0), (5.0, 6.0), (7.0, 8.0), ALL_CORNERS);
+        reader.record_outlines();
+        reader.read_quads.as_mut().unwrap()[row * columns + column] = Some(elsewhere);
+        let quads = reader.cell_quads().unwrap();
+        assert_eq!(quads[row * columns + column].upper_right, (7.0, 8.0));
+        let from_mesh = reader.mesh(0).unwrap().quad(column + 1, rows - 1 - row);
+        assert_eq!(
+            quads[row * columns + column + 1].lower_left,
+            from_mesh.lower_left
+        );
+    }
+
+    #[test]
+    fn outlines_are_only_kept_when_asked_for() {
+        let (raster, _, _) = page();
+        let bitmap = Bitmap::from_raster(&raster);
+        let (grid, intensity) = super::super::find_grid(&bitmap).unwrap();
+        let mut reader = BlockReader::new(&bitmap, grid, intensity);
+        let (column, row) = (reader.columns() / 2, reader.rows() / 2);
+        assert!(matches!(
+            reader.read(column, row),
+            BlockOutcome::Readable { .. }
+        ));
+        assert!(reader.read_quads.is_none());
+        assert!(reader.fork().read_quads.is_none());
+    }
+
+    #[test]
+    fn a_cell_that_did_not_read_is_drawn_between_the_blocks_around_it_that_did() {
+        // Two by two cells of ten pixels, the bitmap counting rows from the bottom; the lower
+        // right cell (row 1 from the top, column 1) did not read.
+        let cell = |left: f64, bottom: f64| {
+            Some(Quad::new(
+                (left, bottom),
+                (left + 10.0, bottom),
+                (left, bottom + 10.0),
+                (left + 10.0, bottom + 10.0),
+                ALL_CORNERS,
+            ))
+        };
+        let read = [cell(0.0, 10.0), cell(10.0, 13.0), cell(0.0, 0.0), None];
+        let drawn = between_read_neighbours(&read, 2, 2);
+        let quad = drawn[3].unwrap();
+        // The corner the upper right block has alone, the one all three share averaged, and
+        // the one no block has completing the parallelogram.
+        assert_eq!(quad.upper_right, (20.0, 13.0));
+        assert_eq!(quad.upper_left, (10.0, 11.0));
+        assert_eq!(quad.lower_left, (10.0, 0.0));
+        assert_eq!(quad.lower_right, (20.0, 2.0));
+        assert_eq!(quad.corners_found, 3);
+        assert_eq!(drawn[0].unwrap().upper_right, (10.0, 20.0));
+
+        // A cell with two corners next to read blocks is not placed by them.
+        let drawn = between_read_neighbours(&[cell(0.0, 0.0), None], 2, 1);
+        assert!(drawn[1].is_none());
+    }
+}

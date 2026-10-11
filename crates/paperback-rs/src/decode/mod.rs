@@ -127,6 +127,9 @@ fn scan_bitmap(raster: &Raster, reading: &Reading, reduced_by: usize) -> Result<
     }
     let mut reader = BlockReader::new(&bitmap, grid, intensity);
     reader.set_threads(wanted.threads);
+    if wanted.quality {
+        reader.record_outlines();
+    }
     reader.tune_sharpness(TUNING_COLUMNS, TUNING_ROWS);
     if !reader.finds_blocks(PROBE_COLUMNS, PROBE_ROWS) {
         return Err(Error::Decode("no readable blocks found in the grid".into()));

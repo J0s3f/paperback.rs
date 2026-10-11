@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.1
+
+- The quality map and overlay draw every block that was read where it was read: through the grid lines it showed, or
+  through the corners of the mesh that read it. They used to draw all blocks through the first corner mesh, whose lines
+  can go astray on crumpled paper while the blocks were read another way; the colours then lay across the printed cells
+  in bands. A block that did not read is drawn between the corners of the blocks around it that did, where they give
+  three of its corners or all four, else through the first mesh as before. The outlines are only kept when the quality
+  is drawn; decoding without it does the same work as before.
+
 ## 1.3.0
 
 - Faster writing: pages are drawn and compressed side by side, and a PNG page is stored with a palette of 2 bits per pixel
