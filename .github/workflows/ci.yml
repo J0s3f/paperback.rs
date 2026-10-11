@@ -13,6 +13,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# The jobs only read the code; the audit job adds what it needs to report its check.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: test (${{ matrix.os }})
