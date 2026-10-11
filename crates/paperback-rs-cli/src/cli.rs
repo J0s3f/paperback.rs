@@ -58,6 +58,8 @@ pub(crate) enum Format {
     Pdf,
 }
 
+// One bool per command line switch.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Args, Debug)]
 pub(crate) struct EncodeArgs {
     /// File to back up; '-' or omitted reads standard input.
@@ -91,9 +93,47 @@ pub(crate) struct EncodeArgs {
     #[arg(long, default_value_t = 70, value_name = "PERCENT")]
     pub(crate) dot_size: usize,
 
-    /// One recovery block per this many data blocks (2 to 10).
-    #[arg(long, default_value_t = 5, value_name = "N")]
-    pub(crate) redundancy: u8,
+    /// PaperBack's redundancy: one recovery block per this many data blocks (2 to 10), which
+    /// rebuilds one lost block per group, also in the original programs. 0 leaves them out.
+    /// [default: 10, with --legacy 5]
+    #[arg(long, value_name = "N", conflicts_with = "modern")]
+    pub(crate) redundancy: Option<u8>,
+
+    /// Parity blocks per 100 data blocks, as many as fit the code (at least 300; more for smaller
+    /// files). Lost blocks up to their number are rebuilt, on whichever pages they were; above
+    /// 16384 data blocks the file is cut into interleaved stripes, each rebuilt only from its own
+    /// share of the parity blocks. The original programs ignore them.
+    /// [default: 10, with --modern 20]
+    #[arg(long, value_name = "PERCENT")]
+    pub(crate) parity: Option<u32>,
+
+    /// Use the whole paper of every page: the free cells hold more parity blocks. The number of
+    /// pages stays the same. On with --modern; `--fill-pages false` turns it off again.
+    /// [default: false, with --modern true]
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub(crate) fill_pages: Option<bool>,
+
+    /// Pages as PaperBack 1.10 writes them: its recovery blocks (one per 5 data blocks unless
+    /// --redundancy says otherwise) and nothing else, no parity blocks and no records.
+    #[arg(long, conflicts_with_all = ["modern", "balanced", "parity", "fill_pages"])]
+    pub(crate) legacy: bool,
+
+    /// The default: recovery blocks that the original programs use too (one per 10 data blocks),
+    /// 10 parity blocks per 100 data blocks and the records with the hash of the file.
+    #[arg(long, conflicts_with_all = ["modern", "legacy"])]
+    pub(crate) balanced: bool,
+
+    /// Pages for paperback.rs: no recovery blocks of PaperBack but as many more parity blocks,
+    /// filled pages, and the hash of the file (or keyed check value) on every page, required.
+    /// The original programs still read the pages but cannot rebuild lost blocks.
+    #[arg(long, conflicts_with = "no_extensions")]
+    pub(crate) modern: bool,
 
     #[arg(long, value_enum, default_value = "max")]
     pub(crate) compression: CompressionLevel,
@@ -119,6 +159,8 @@ pub(crate) struct EncodeArgs {
     pub(crate) password: PasswordArgs,
 }
 
+// One bool per command line switch.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Args, Debug)]
 pub(crate) struct DecodeArgs {
     /// Page images or PDFs; '-' or none reads one image from standard input.
@@ -155,6 +197,10 @@ pub(crate) struct DecodeArgs {
     /// none. Without this, someone who can change the pages can also take the hash off them.
     #[arg(long)]
     pub(crate) require_hash: bool,
+
+    /// For pages written with `encode --modern`: the same as --require-hash.
+    #[arg(long)]
+    pub(crate) modern: bool,
 
     #[command(flatten)]
     pub(crate) password: PasswordArgs,

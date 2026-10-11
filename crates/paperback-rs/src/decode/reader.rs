@@ -142,7 +142,7 @@ const MOST_THREADS: usize = 256;
 
 /// Thread pools of the sizes asked for, made when first needed and kept for the life of the
 /// program; `None` for a size that could not be made.
-fn pool_of(threads: usize) -> Option<&'static rayon::ThreadPool> {
+pub(super) fn pool_of(threads: usize) -> Option<&'static rayon::ThreadPool> {
     static POOLS: Mutex<Vec<(usize, Option<&'static rayon::ThreadPool>)>> = Mutex::new(Vec::new());
     let threads = threads.min(MOST_THREADS);
     let mut pools = POOLS.lock().ok()?;
@@ -194,6 +194,9 @@ pub(crate) struct BlockReader<'a> {
     /// Threads to try ways of reading a block on; 0 is as many as the processor has.
     threads: usize,
     effort: Effort,
+    /// Whether blocks that do not read where the grid says may be read through the corner mesh,
+    /// which is built for the whole page the first time a block needs it.
+    meshes_allowed: bool,
     /// Learns from the blocks that were read how dots look on this page.
     detector: DotDetector,
     /// A copy made to try a way of reading a block keeps what the detector should learn from
@@ -260,6 +263,7 @@ impl<'a> BlockReader<'a> {
             meshes: MESH_TRUSTS.iter().map(|_| MeshState::NotBuilt).collect(),
             threads: 1,
             effort: Effort::Quick,
+            meshes_allowed: true,
             detector: DotDetector::new(),
             recording: false,
             lessons: Vec::new(),
@@ -302,6 +306,22 @@ impl<'a> BlockReader<'a> {
         self.effort = effort;
     }
 
+    /// Allows or forbids reading through the corner mesh; a few blocks that only identify the page
+    /// are not worth building it.
+    pub(crate) fn allow_meshes(&mut self, allowed: bool) {
+        self.meshes_allowed = allowed;
+    }
+
+    /// The mesh settings a block is tried with at the present effort: one, every one at the
+    /// deepest effort, none when meshes are not allowed.
+    fn meshes_in_use(&self) -> usize {
+        match (self.meshes_allowed, self.effort) {
+            (false, _) | (true, Effort::Quick) => 0,
+            (true, Effort::Normal) => 1,
+            (true, Effort::Deep) => MESH_TRUSTS.len(),
+        }
+    }
+
     pub(crate) fn columns(&self) -> usize {
         self.columns
     }
@@ -328,12 +348,7 @@ impl<'a> BlockReader<'a> {
     /// and the rotation of the blocks around it, and a few rotations near theirs.
     fn other_ways(&self, column: usize, row: usize) -> Vec<Way> {
         // A block that one mesh cannot read is tried with the next: whatever any of them reads is kept.
-        let meshes = if self.effort == Effort::Deep {
-            MESH_TRUSTS.len()
-        } else {
-            1
-        };
-        let mut ways: Vec<Way> = (0..meshes).map(Way::Warped).collect();
+        let mut ways: Vec<Way> = (0..self.meshes_in_use()).map(Way::Warped).collect();
         let neighbours = self.neighbour_shifts(column, row);
         if let Some(average) = Self::mean(&neighbours) {
             let tilt = self.neighbour_tilt(column, row);
@@ -468,11 +483,12 @@ impl<'a> BlockReader<'a> {
         mesh.map_or(MeshState::Missing, |mesh| MeshState::Built(Arc::new(mesh)))
     }
 
-    /// Builds the meshes of every setting, side by side: they do not depend on each other, and
-    /// the blocks that are tried with several ways need them all sooner or later, the first one
-    /// at once. With threads to spare this costs the time of one.
+    /// Builds the meshes of the settings in use at the present effort, side by side: they do not
+    /// depend on each other, and the blocks that are tried with several ways need them all sooner
+    /// or later, the first one at once. With threads to spare this costs the time of one. The
+    /// settings only the deepest effort uses are not built before it.
     fn ensure_meshes(&mut self, pool: &rayon::ThreadPool) {
-        let missing: Vec<usize> = (0..MESH_TRUSTS.len())
+        let missing: Vec<usize> = (0..self.meshes_in_use())
             .filter(|&variant| matches!(self.meshes[variant], MeshState::NotBuilt))
             .collect();
         let built: Vec<(usize, MeshState)> = pool.install(|| {
@@ -530,6 +546,7 @@ impl<'a> BlockReader<'a> {
             meshes: self.meshes.clone(),
             threads,
             effort: self.effort,
+            meshes_allowed: self.meshes_allowed,
             detector: self.detector.clone(),
             recording: true,
             lessons: Vec::new(),
@@ -987,11 +1004,21 @@ impl<'a> BlockReader<'a> {
         tilt: f64,
         every_level: bool,
     ) -> BlockOutcome {
-        let x0 =
-            (self.grid.x_peak + self.grid.x_step * (column as f64 - self.border) + shift.0) as i32;
-        let y0 = (self.grid.y_peak
+        let mut x0 = self.grid.x_peak + self.grid.x_step * (column as f64 - self.border) + shift.0;
+        let mut y0 = self.grid.y_peak
             + self.grid.y_step * (self.rows as f64 - row as f64 - 1.0 - self.border)
-            + shift.1) as i32;
+            + shift.1;
+        // The angles move every pixel by its distance from the corner of the page; the tilt
+        // turns the block about its own middle, so the cut takes back what the tilt adds there.
+        // Without this a tilt of a degree moves a block at the far side of the page by a whole
+        // cell, onto the block next to it.
+        if tilt != 0.0 {
+            let middle_x = x0 + self.buffer_width as f64 / 2.0;
+            let middle_y = y0 + self.buffer_height as f64 / 2.0;
+            x0 -= middle_y * tilt;
+            y0 += middle_x * tilt;
+        }
+        let (x0, y0) = (x0 as i32, y0 as i32);
         let mut outcome = BlockOutcome::Missing;
         let levels = if every_level { self.boosts.len() } else { 1 };
         // The block is cut out of the page once; each sharpness level starts from that cut.

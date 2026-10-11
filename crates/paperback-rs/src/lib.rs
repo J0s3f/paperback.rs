@@ -43,6 +43,7 @@ pub mod error;
 pub mod imageio;
 pub mod layout;
 mod pagetext;
+mod parity;
 mod pbx;
 mod pdfimage;
 mod plan;

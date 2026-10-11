@@ -8,8 +8,10 @@ use std::path::PathBuf;
 
 use paperback_rs::encode::Page;
 use paperback_rs::imageio::{self, OutputFormat};
+use rayon::prelude::*;
 
 use crate::cli::Format;
+
 use crate::error::{CliError, Result};
 
 const STDOUT: &str = "-";
@@ -66,13 +68,13 @@ impl Destination {
                     .map_err(|e| CliError::other(format!("{}: {e}", path.display())))
             }
             Self::Numbered { numbering, format } => {
-                for (index, page) in pages.iter().enumerate() {
+                // Compressing the pictures is most of the work; the pages are done side by side.
+                pages.par_iter().enumerate().try_for_each(|(index, page)| {
                     let path = numbering.name(index + 1);
                     let bytes = encode_page(*format, page)?;
                     std::fs::write(&path, bytes)
-                        .map_err(|e| CliError::other(format!("{path}: {e}")))?;
-                }
-                Ok(())
+                        .map_err(|e| CliError::other(format!("{path}: {e}")))
+                })
             }
         }
     }
@@ -101,7 +103,7 @@ fn single_document(format: OutputFormat, pages: &[Page]) -> Result<Vec<u8>> {
 /// PDFs are made for printing, so their pages are pure black and white (see
 /// [`Page::black_and_white`]); PNG and BMP keep the gray levels of the original program.
 fn printable(pages: &[Page]) -> Vec<Page> {
-    pages.iter().map(Page::black_and_white).collect()
+    pages.par_iter().map(Page::black_and_white).collect()
 }
 
 fn encode_page(format: OutputFormat, page: &Page) -> Result<Vec<u8>> {

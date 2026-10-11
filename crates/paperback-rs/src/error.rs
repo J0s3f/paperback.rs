@@ -45,6 +45,11 @@ pub enum Error {
     #[error("the restored file does not match the SHA-256 stored on the pages")]
     /// The pages carry a hash of the file and the restored file differs from it.
     HashMismatch,
+    #[error(
+        "the pages carry different hashes of the file: one belongs to another file or was changed"
+    )]
+    /// Pages of one backup carry different hashes of the file, so it cannot be checked.
+    ConflictingHashes,
     #[error("the pages do not carry a hash that the restored file matches, which was required")]
     /// A hash was required and the pages show none that was checked.
     NotVerified,

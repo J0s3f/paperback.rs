@@ -91,8 +91,14 @@ pub(crate) struct SheetRecord {
     pub(crate) page_count: u16,
     pub(crate) columns: u16,
     pub(crate) rows: u16,
-    /// Data blocks per recovery block.
+    /// Data blocks per recovery block; 0 for pages without PaperBack's recovery blocks.
     pub(crate) group_size: u8,
+    /// Index of the first parity block on the page (see [`crate::parity`]).
+    pub(crate) parity_first: u32,
+    /// Parity blocks on the page.
+    pub(crate) parity_count: u32,
+    /// Parity blocks of the whole file.
+    pub(crate) parity_total: u32,
 }
 
 /// A check value of the file the pages hold, and its size to tie it to this file. It is the
@@ -139,6 +145,11 @@ impl Record {
                     body[start..start + 2].copy_from_slice(&number.to_le_bytes());
                 }
                 body[SHEET_ID_LEN + 8] = sheet.group_size;
+                let parity = [sheet.parity_first, sheet.parity_count, sheet.parity_total];
+                for (at, number) in parity.iter().enumerate() {
+                    let start = SHEET_ID_LEN + 9 + at * 4;
+                    body[start..start + 4].copy_from_slice(&number.to_le_bytes());
+                }
             }
             Self::Hash(hash) => {
                 body[..HASH_LEN].copy_from_slice(&hash.digest);
@@ -158,6 +169,8 @@ impl Record {
         }
         let body = &payload[BODY_OFFSET..];
         let number = |at: usize| u16::from_le_bytes([body[at], body[at + 1]]);
+        let wide =
+            |at: usize| u32::from_le_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
         match payload[KIND_OFFSET] {
             SHEET_KIND => {
                 let mut id = [0u8; SHEET_ID_LEN];
@@ -169,6 +182,9 @@ impl Record {
                     columns: number(SHEET_ID_LEN + 4),
                     rows: number(SHEET_ID_LEN + 6),
                     group_size: body[SHEET_ID_LEN + 8],
+                    parity_first: wide(SHEET_ID_LEN + 9),
+                    parity_count: wide(SHEET_ID_LEN + 13),
+                    parity_total: wide(SHEET_ID_LEN + 17),
                 }))
             }
             HASH_KIND => {
@@ -272,7 +288,22 @@ mod tests {
             columns: 21,
             rows: 33,
             group_size: 5,
+            parity_first: 0,
+            parity_count: 0,
+            parity_total: 0,
         }
+    }
+
+    #[test]
+    fn the_parity_numbers_survive_a_sheet_record() {
+        let record = Record::Sheet(SheetRecord {
+            group_size: 0,
+            parity_first: 70_000,
+            parity_count: 1234,
+            parity_total: 99_999,
+            ..a_sheet()
+        });
+        assert_eq!(Record::parse(&record.to_payload()), Some(record));
     }
 
     #[test]

@@ -4,16 +4,16 @@
 
 //! Geometry of a page: how many blocks fit and where every dot goes.
 
-use crate::block::{BLOCK_DOTS, DATA_LEN, Redundancy};
+use crate::block::BLOCK_DOTS;
 use crate::error::{Error, Result};
 use crate::pagetext::TextStyle;
+use crate::plan::{MIN_ROWS, Strings, has_room};
 
 /// Blocks are separated by three dot pitches (two before, one after the grid line).
 pub(crate) const CELL_DOTS: usize = BLOCK_DOTS + 3;
 /// Dots between the grid line and the first dot of a block.
 const BLOCK_LEAD_DOTS: usize = 2;
 const MIN_DOT_PITCH: usize = 2;
-const MIN_ROWS: usize = 3;
 /// Width of the quiet margin around the grid in image output.
 const PLAIN_BORDER: usize = 25;
 const BORDER_DOTS: usize = 16;
@@ -144,7 +144,7 @@ impl PageSetup {
 }
 
 impl PageLayout {
-    pub(crate) fn compute(setup: &PageSetup, redundancy: Redundancy) -> Result<Self> {
+    pub(crate) fn compute(setup: &PageSetup, strings: Strings) -> Result<Self> {
         setup.validate()?;
         let (paper_width, paper_height) = setup.paper.size_in_mils();
         let to_pixels = |mils: usize| mils * setup.printer_dpi / THOUSANDTHS_PER_INCH;
@@ -170,8 +170,8 @@ impl PageLayout {
 
         let nx = width.saturating_sub(px + 2 * border) / (CELL_DOTS * dx);
         let ny = height.saturating_sub(py + 2 * border) / (CELL_DOTS * dy);
-        let group = redundancy.group_size();
-        if nx < group + 1 || ny < MIN_ROWS || nx * ny < 2 * group + 2 {
+        let count = strings.count();
+        if nx < count || ny < MIN_ROWS || !has_room(nx * ny, strings, 0) {
             return Err(Error::PageTooSmall);
         }
         let layout = Self {
@@ -193,18 +193,19 @@ impl PageLayout {
         Ok(layout)
     }
 
-    /// Bytes of payload on a full page: per string of `group` data blocks one
-    /// recovery block and, per page, one superblock for every string.
+    /// Bytes of payload on a full page: per row of the strings one block of every data
+    /// string (and a recovery block) and, per page, one superblock for every string.
     ///
     /// `reserved` cells are kept free for other uses (see [`crate::plan::RECORD_CELLS`]).
-    pub(crate) fn page_capacity(&self, redundancy: Redundancy, reserved: usize) -> usize {
-        let group = redundancy.group_size();
-        ((self.nx * self.ny - reserved - group - 2) / (group + 1)) * group * DATA_LEN
+    #[cfg(test)]
+    pub(crate) fn page_capacity(&self, strings: Strings, reserved: usize) -> usize {
+        let count = strings.count();
+        ((self.nx * self.ny - reserved - count - 1) / count) * strings.data * crate::block::DATA_LEN
     }
 
     /// Whether the page is large enough to give up `reserved` cells and still hold data.
-    pub(crate) fn has_room_for(&self, redundancy: Redundancy, reserved: usize) -> bool {
-        self.nx * self.ny >= reserved + 2 * redundancy.group_size() + 2
+    pub(crate) fn has_room_for(&self, strings: Strings, reserved: usize) -> bool {
+        has_room(self.nx * self.ny, strings, reserved)
     }
 
     pub(crate) fn image_width(&self) -> usize {
@@ -248,9 +249,14 @@ mod tests {
 
     #[test]
     fn default_a4_page_at_600_dpi_holds_a_sensible_amount() {
-        let layout = PageLayout::compute(&PageSetup::default(), Redundancy::default()).unwrap();
+        let layout = PageLayout::compute(
+            &PageSetup::default(),
+            Strings::new(Some(crate::block::Redundancy::default())),
+        )
+        .unwrap();
         assert_eq!((layout.dx, layout.px), (3, 2));
-        let capacity = layout.page_capacity(Redundancy::default(), 0);
+        let capacity =
+            layout.page_capacity(Strings::new(Some(crate::block::Redundancy::default())), 0);
         assert!(
             (100_000..400_000).contains(&capacity),
             "capacity {capacity}"
@@ -259,7 +265,11 @@ mod tests {
 
     #[test]
     fn image_width_is_a_multiple_of_four() {
-        let layout = PageLayout::compute(&PageSetup::default(), Redundancy::default()).unwrap();
+        let layout = PageLayout::compute(
+            &PageSetup::default(),
+            Strings::new(Some(crate::block::Redundancy::default())),
+        )
+        .unwrap();
         assert_eq!(layout.image_width() % 4, 0);
     }
 
@@ -270,7 +280,10 @@ mod tests {
             ..PageSetup::default()
         };
         assert!(matches!(
-            PageLayout::compute(&setup, Redundancy::default()),
+            PageLayout::compute(
+                &setup,
+                Strings::new(Some(crate::block::Redundancy::default()))
+            ),
             Err(Error::PageTooSmall)
         ));
     }

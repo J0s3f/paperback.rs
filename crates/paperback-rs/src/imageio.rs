@@ -8,6 +8,7 @@ use std::io::Cursor;
 use image::{DynamicImage, ImageReader};
 use miniz_oxide::deflate::compress_to_vec_zlib;
 use pdf_writer::{Content, Filter, Finish, Name, Pdf, Rect, Ref};
+use rayon::prelude::*;
 
 use crate::encode::Page;
 use crate::error::{Error, Result};
@@ -20,6 +21,9 @@ const MAX_SIDE: u32 = 1 << 17;
 const MAX_DECODE_BYTES: u64 = 2 << 30;
 const METERS_PER_INCH_X10000: u32 = 254;
 const PDF_COMPRESSION_LEVEL: u8 = 6;
+/// Deflate level of palette PNGs: as small as 8-bit gray at the default level, and five times
+/// faster (a 600 dpi page: 530 kB in 65 ms against 580 kB in 340 ms).
+const PALETTE_PNG_LEVEL: u8 = 3;
 const BMP_FILE_HEADER_LEN: u32 = 14;
 const BMP_INFO_HEADER_LEN: u32 = 40;
 const BMP_PALETTE_LEN: u32 = 256 * 4;
@@ -91,26 +95,83 @@ fn to_gray(image: &DynamicImage) -> Result<Raster> {
         .ok_or_else(|| Error::Image("the picture data does not match its size".into()))
 }
 
-/// PNG with the page resolution stored.
+/// PNG with the page resolution stored. A picture of at most 16 gray levels (a rendered page has
+/// four) is stored with a palette of 1, 2 or 4 bits per pixel: the same grays, and a quarter of the
+/// bytes to compress, which makes the file smaller and five times faster to write than 8-bit gray.
 pub fn write_png(page: &Page) -> Result<Vec<u8>> {
     let raster = &page.raster;
     let mut out = Vec::new();
     let mut encoder = png::Encoder::new(&mut out, raster.width() as u32, raster.height() as u32);
-    encoder.set_color(png::ColorType::Grayscale);
-    encoder.set_depth(png::BitDepth::Eight);
     let per_meter = pixels_per_meter(page.dpi);
     encoder.set_pixel_dims(Some(png::PixelDimensions {
         xppu: per_meter,
         yppu: per_meter,
         unit: png::Unit::Meter,
     }));
+    let packed = if let Some(levels) = gray_levels(raster) {
+        let bits = match levels.len() {
+            0..=2 => 1,
+            3..=4 => 2,
+            _ => 4,
+        };
+        encoder.set_color(png::ColorType::Indexed);
+        encoder.set_depth(match bits {
+            1 => png::BitDepth::One,
+            2 => png::BitDepth::Two,
+            _ => png::BitDepth::Four,
+        });
+        encoder.set_palette(
+            levels
+                .iter()
+                .flat_map(|&level| [level; 3])
+                .collect::<Vec<u8>>(),
+        );
+        encoder.set_deflate_compression(png::DeflateCompression::Level(PALETTE_PNG_LEVEL));
+        Some(pack_indices(raster, &levels, bits))
+    } else {
+        encoder.set_color(png::ColorType::Grayscale);
+        encoder.set_depth(png::BitDepth::Eight);
+        None
+    };
     let png_error = |e: png::EncodingError| Error::Image(e.to_string());
     let mut writer = encoder.write_header().map_err(png_error)?;
     writer
-        .write_image_data(raster.pixels())
+        .write_image_data(packed.as_deref().unwrap_or(raster.pixels()))
         .map_err(png_error)?;
     writer.finish().map_err(png_error)?;
     Ok(out)
+}
+
+/// The gray levels of a picture that has at most 16 of them, from dark to light.
+fn gray_levels(raster: &Raster) -> Option<Vec<u8>> {
+    let mut seen = [false; 256];
+    for &pixel in raster.pixels() {
+        seen[usize::from(pixel)] = true;
+    }
+    let levels: Vec<u8> = (0..=255u8)
+        .filter(|&level| seen[usize::from(level)])
+        .collect();
+    (levels.len() <= 16).then_some(levels)
+}
+
+/// The rows of a picture as palette indices of `bits` bits, the leftmost pixel in the high bits.
+fn pack_indices(raster: &Raster, levels: &[u8], bits: usize) -> Vec<u8> {
+    let mut index = [0u8; 256];
+    for (at, &level) in levels.iter().enumerate() {
+        index[usize::from(level)] = at as u8;
+    }
+    let per_byte = 8 / bits;
+    let row_bytes = raster.width().div_ceil(per_byte);
+    let mut packed = Vec::with_capacity(row_bytes * raster.height());
+    for y in 0..raster.height() {
+        packed.extend(raster.row(y).chunks(per_byte).map(|pixels| {
+            let byte = pixels.iter().fold(0u8, |byte, &pixel| {
+                (byte << bits) | index[usize::from(pixel)]
+            });
+            byte << (bits * (per_byte - pixels.len()))
+        }));
+    }
+    packed
 }
 
 /// PNG of a colour picture such as a quality map.
@@ -175,12 +236,26 @@ pub fn write_pdf(pages: &[Page]) -> Vec<u8> {
         .map(|i| Ref::new(first_free + 3 * i as i32))
         .collect();
 
+    // Compressing the pictures is most of the work; the pages are compressed side by side.
+    let images: Vec<(Vec<u8>, i32)> = pages
+        .par_iter()
+        .map(|page| {
+            // Pages made of black and white dots only need one bit per pixel: eight times fewer
+            // samples to store, and nothing gray for a viewer or printer driver to smooth.
+            let (samples, bits) = match pack_black_and_white(&page.raster) {
+                Some(packed) => (packed, 1),
+                None => (page.raster.pixels().to_vec(), 8),
+            };
+            (compress_to_vec_zlib(&samples, PDF_COMPRESSION_LEVEL), bits)
+        })
+        .collect();
+
     pdf.catalog(catalog_id).pages(tree_id);
     pdf.pages(tree_id)
         .kids(page_refs.iter().copied())
         .count(pages.len() as i32);
 
-    for (page, &page_id) in pages.iter().zip(&page_refs) {
+    for ((page, &page_id), (compressed, bits)) in pages.iter().zip(&page_refs).zip(&images) {
         let content_id = Ref::new(page_id.get() + 1);
         let image_id = Ref::new(page_id.get() + 2);
         let width_pt = page.raster.width() as f32 * PDF_POINTS_PER_INCH / page.dpi as f32;
@@ -201,19 +276,12 @@ pub fn write_pdf(pages: &[Page]) -> Vec<u8> {
         content.restore_state();
         pdf.stream(content_id, &content.finish());
 
-        // Pages made of black and white dots only need one bit per pixel: eight times fewer
-        // samples to store, and nothing gray for a viewer or printer driver to smooth.
-        let (samples, bits) = match pack_black_and_white(&page.raster) {
-            Some(packed) => (packed, 1),
-            None => (page.raster.pixels().to_vec(), 8),
-        };
-        let compressed = compress_to_vec_zlib(&samples, PDF_COMPRESSION_LEVEL);
-        let mut image = pdf.image_xobject(image_id, &compressed);
+        let mut image = pdf.image_xobject(image_id, compressed);
         image.filter(Filter::FlateDecode);
         image.width(page.raster.width() as i32);
         image.height(page.raster.height() as i32);
         image.color_space().device_gray();
-        image.bits_per_component(bits);
+        image.bits_per_component(*bits);
         image.finish();
     }
     pdf.finish()
@@ -245,6 +313,28 @@ mod tests {
         Page {
             raster: Raster::from_pixels(60, 40, pixels).unwrap(),
             dpi: 300,
+        }
+    }
+
+    #[test]
+    fn a_page_of_few_grays_is_stored_with_a_palette_and_reads_back_the_same() {
+        for levels in [
+            vec![0u8, 255],
+            vec![0, 64, 128, 255],
+            vec![0, 17, 34, 51, 64, 99, 128, 200, 255],
+        ] {
+            // 61 pixels wide: the rows do not end on a byte boundary.
+            let pixels: Vec<u8> = (0..61 * 9)
+                .map(|i| levels[(i * 7 + i / 5) % levels.len()])
+                .collect();
+            let page = Page {
+                raster: Raster::from_pixels(61, 9, pixels).unwrap(),
+                dpi: 600,
+            };
+            let png = write_png(&page).unwrap();
+            // The colour type byte of the header: 3 is a palette.
+            assert_eq!(png[25], 3, "{levels:?}");
+            assert_eq!(read_pages(&png).unwrap(), vec![page.raster]);
         }
     }
 

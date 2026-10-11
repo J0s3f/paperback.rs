@@ -5,8 +5,8 @@
 Pages written by the original must decode here and the other way round. This fixes the format, the
 Reed-Solomon variant, the CRC mask, the placement of blocks, the XOR mask and the password handling.
 Considered: a cleaner new format. Rejected because existing backups must stay readable.
-Verified by `tools/interop` against the original executables, and by `tests/reference_vectors.rs`
-(vectors produced by compiling the original C code).
+Verified by `tools/interop` against the original executables, and by `src/original_vectors.rs` with
+`tests/fixtures/original_blocks.txt` (vectors produced by compiling the original C code).
 
 ## Decoder is a close port of the original
 
@@ -476,3 +476,130 @@ one thread and 106 on 16, 10 seconds on the clock, because blocks are read ahead
 what they start from, and the three meshes are built together at the start of each pass instead of when first needed. The first
 look at a picture (finding the grid, the quick pass over every block) is still on one thread, about 0.4 seconds per try.
 `--threads N` (library: `DecodeOptions::threads`) sets the number; 0, the default, is as many as the processor has.
+
+### Parity blocks and the effort spent on a page
+
+A page that does not read completely is read again: straightened by the estimated skew and four nudges of it, each time with
+passes of more effort over the missing blocks. On a page with wiped cells or stains that is all in vain, and before parity
+blocks it was the only hope. Pages damaged with `tools/damage.py` (600 dpi, a file of 400 kB or 60 kB) and profiled with
+`perf` on Linux spent 80% of the time in those readings (`read_posed`, `recognise`, the corner mesh and Reed-Solomon
+attempts on cells that hold nothing), and almost none in the parity code.
+
+Now a page counts as read once the parity blocks read on it cover, in every stripe, the data blocks it still lacks after the
+recovery blocks of PaperBack: then no further reading of the page and no pass of more effort is needed. If every page covers its
+own losses, the parity blocks of all of them rebuild the file. When that is not enough (a page is missing, say), the pages
+that stopped early are read again with every attempt, and the blocks found are added. Pages without parity blocks (all pages
+of the original programs) read as before.
+
+| Pages (all restored) | Before | After |
+|---|---|---|
+| `--modern`, 3 pages, 5% of the area wiped, a band, a stain | 131 s | 7.9 s |
+| default profile, 3 pages, 2% wiped, a band, a stain | 84 s | 9.0 s |
+| `--modern --parity 60`, page 2 of 4 lost, 3% wiped | 118 s | 9.1 s |
+| `--modern`, 1 page, 25% wiped, two bands, two stains | 102 s | 3.6 s |
+
+What is left is the corner mesh (`mesh::Arm::ridge`, half of the time) and the first reading of every block.
+
+### Writing pages, and the corner mesh of pages that do not need it
+
+A profile of the whole program on good and damaged pages (600 dpi A4, 4 cores):
+
+- **Writing** spent 70-74% in deflate (PNG) and ran on one core. A rendered page has four gray levels (paper, dots, grid
+  lines, text), so a PNG is now written with a palette of 2 bits per pixel at deflate level 3: the same grays, a quarter of
+  the bytes to compress, 65 ms and 530 kB a page against 340 ms and 580 kB as 8-bit gray. A picture with more than 16 grays
+  is written as before. The pages are drawn, compressed and written side by side, the pictures of a PDF compressed side by
+  side (the PDF is the same byte for byte).
+- **Reading** spent about 55% in the corner mesh (`mesh::Arm::ridge`, `mesh::sample`), on flat, clean pages too. Every page
+  after the first is matched against the sheets read before with a few blocks read at normal effort (`look_for_sheet`); one of
+  them that does not read, a cell over the title say, built the mesh of the page, and building one setting built all three,
+  although only the deepest effort uses more than the first. Now those few blocks are read without the mesh (what does not
+  read is read with it in the passes that follow), and only the settings the effort uses are built.
+
+| 600 dpi A4 | Before | After |
+|---|---|---|
+| write 400 kB as 3 PNG | 1.36 s, 1.7 MB | 0.27 s, 1.4 MB |
+| write 3 MB as 19 PNG | 9.98 s, 12.9 MB | 1.37 s, 10.5 MB |
+| write 3 MB as one PDF | 7.70 s | 2.73 s |
+| read 3 good pages (`--legacy` / default / `--modern`) | 8.2 / 9.2 / 11.0 s | 4.2 / 4.1 / 5.0 s |
+| read 19 good pages | 74.4 s | 28.7 s |
+| read 3 damaged pages (`--legacy` / default / `--modern`) | 8.8 / 11.1 / 9.9 s | 4.4 / 8.5 / 5.3 s |
+
+Every set read the same number of blocks before and after.
+
+Rebuilding from parity blocks works on the stripes side by side and eliminates in the logarithm domain (one table lookup per
+element): 5000 lost blocks of a file of 33000 take 0.33 s, 1900 take 79 ms (`parity_speed`, ignored test).
+
+
+### The length of a parity stripe
+
+A stripe is a Cauchy code over GF(2^16): its parity rows and its data columns must be distinct elements of the field,
+so a stripe of `c` columns has at most `65536 - c` rows. Within a stripe any lost data blocks up to the number of parity
+blocks read are rebuilt; across stripes only each one's own share helps, so the longer the stripe, the larger the files
+for which the plain rule holds. The cost grows with it: every parity block sums over the whole stripe, and rebuilding
+eliminates over the losses of a stripe. `parity_speed` (33000 data blocks, 6600 parity blocks, losses in one run):
+
+| Stripe length | Stripes | Encode | Rebuild 100 | Rebuild 1900 | Rebuild 5000 |
+|---|---|---|---|---|---|
+| 4096 | 9 | 111 ms | 3.6 ms | 53 ms | 244 ms |
+| 8192 | 5 | 192 ms | 4.6 ms | 89 ms | 508 ms |
+| 16384 | 3 | 322 ms | 6.7 ms | 174 ms | 1318 ms |
+
+The stripe is 16384 data blocks (about 1.4 MB as stored, some 9 pages): the guarantee holds for every file up to that
+size, and a full stripe still leaves room for three parity blocks per data block. Files of up to 4096 blocks are one
+stripe either way and cost the same as before. `--parity` takes as many as fit rather than a fixed most: for a small
+file the code would allow far more, and then the paper is the limit, which `encode` reports. A larger field, or a code
+built for many blocks, would be the way to the plain rule for files beyond one stripe.
+
+The table was measured with the elimination of the next section's "before"; the rebuild columns no longer apply.
+
+### Rebuilding without elimination
+
+Rebuilding `n` lost blocks of a stripe was a Gauss-Jordan elimination of an `n` by `n` matrix: `n^3` steps and `n^2`
+symbols in memory, for every stripe at once. With stripes of 16384 a lost page of a large file meant thousands of
+blocks per stripe, and a review showed that a few pages of forged parity blocks could ask for that work on purpose (a
+4096 by 4096 matrix is 33 MB, and the stripes were solved side by side).
+
+The rows and the lost columns of a stripe form a Cauchy matrix, and a Cauchy matrix has an inverse in closed form
+(`docs/format.md`, "The code"): two products per row and per column, `2 n^2` steps, and then every rebuilt block is a
+sum of `n` scaled rows, which the elimination had to do as well. Nothing of size `n^2` is held. What remains is the
+part that does not depend on the method, taking the known blocks out of each parity row, `n` times the stripe length.
+`parity_speed` (33000 data blocks in 3 stripes, 6600 parity blocks, losses in one run):
+
+| Rebuild | 100 | 1900 | 5000 | 10000 of one full stripe |
+|---|---|---|---|---|
+| Elimination | 6.3 ms | 167 ms | 1189 ms | (minutes, `n^3`) |
+| Closed form | 6.8 ms | 90 ms | 258 ms | 859 ms |
+
+The work now grows with the parity blocks read times the stripe, which is what the pages given bring with them. The
+encoder also works on one stripe after the other, so it holds the logarithms of one stripe rather than of the whole
+file (some 270 MB for the largest file before).
+
+### Parity blocks that are not what they say
+
+A parity block passes the block checksum and the error correction like any other block; that it belongs to this file
+and holds what its address says, nothing on the page shows. A page of another backup with the same name, sizes and
+time, or a forged page, could put one in, and the rebuilt blocks would be wrong without a sign (the hash, when the
+pages carry one, would still catch it). What is done about it:
+
+- A stripe that has one parity block more than it lacks blocks checks the rebuilt blocks against it, and rebuilds
+  nothing if they do not fit. The cost is one row, against `n` for the rebuild. A forged block can then only keep a
+  stripe from being rebuilt, which is what leaving it out would do as well.
+- Only the parity blocks the sheet records announce for the file are taken (`parity_total`), so a forged block cannot
+  take a number the file does not have and become the row that checks the others.
+- A parity block read twice with different contents is not used at all: one of the two is not genuine.
+- Pages that carry different hashes of the file are refused, whichever the file matches; before, the first one read
+  was used, so a forged page read first decided.
+
+Not done: data blocks of another backup are still taken as they come (first read, first kept), as in the originals;
+only the hash shows them. And a page whose layout is known drops blocks read in the wrong cell (`positions.rs`).
+
+### Pages that stopped early and the file still lacks blocks
+
+A page stops being read once its recovery blocks or its parity blocks cover what it lacks. That is a guess made on the
+page alone: the assembler may not take the recovery block (another page told a different group size, or the layout
+showed it in the wrong cell and it was dropped), and parity blocks are shared by all pages. Before, only pages that
+stopped on their parity blocks were read again at the end; a page that stopped because its recovery blocks seemed to
+cover it was not, and the file stayed incomplete. Now every page that stopped with blocks missing is read again, with
+every attempt and until it lacks nothing, as long as the file is incomplete. The counts of the page in the report are
+then those of that reading. A parity block read in two cells (a grid one cell off) counts once, as in the assembler,
+and a label whose page lies beyond the end of the data is not taken: it carries no block, so it lacked none.

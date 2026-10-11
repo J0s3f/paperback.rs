@@ -38,6 +38,46 @@ line. Rows run left to right. A group of `r` data strings plus one recovery stri
 superblock followed by one block per group) is laid out so that members of one group are never in
 the same column; remaining cells repeat the superblock. Details: `plan.rs`.
 
+### Parity blocks and filled pages (paperback.rs only)
+
+Without parity and `--fill-pages` the pages are filled one after the other, as by the originals, and the last page
+shrinks to the rows it needs. With parity blocks, or with `--fill-pages`, the file is spread evenly: with `p` pages and
+`T` groups, every page holds `ceil(T / p)` groups (the label's page size is that many groups in bytes, which keeps
+groups whole, as the originals expect), and `p` is the fewest pages that also have room for the parity asked for.
+
+Behind the strings come the **parity blocks** of the page, a run of consecutive indices; every 8th of these cells is a
+copy of the label instead, in case label blocks do not read. The runs are shared out evenly over the pages. With
+`--fill-pages` every page uses all its rows and every free cell holds a parity block, so the file has as many parity
+blocks as fit; otherwise the remaining cells repeat the label, as in the originals.
+
+A page without PaperBack's recovery blocks (`--redundancy 0`) has six data strings and no recovery string.
+
+**Parity block addresses** lie between those of data blocks: parity block `k` has the address
+`90 * (k / 89) + k % 89 + 1`, which is never a multiple of 90. Both originals accept a data block only if its address is
+a multiple of 90 below the end of the data (`Addblock` in `Fileproc.cpp`), so they drop parity blocks without effect,
+whatever the size of the file. This needs no room behind the end of the data, unlike the records, gives 89 parity
+addresses per data block, and cannot be mistaken for a data block, a recovery block or a record.
+
+**The code** (`parity.rs`): a block is 45 symbols of 16 bits (little endian), over GF(2^16) with the polynomial
+`x^16 + x^12 + x^3 + x + 1` (`0x1100B`) and generator 2, as in PAR2. The data blocks are cut into `s = ceil(n / 16384)`
+interleaved stripes (`n` data blocks): data block `i` is column `j = i / s` of stripe `i % s`, parity block `k` is row
+`r = k / s` of stripe `k % s`. Row `r` of a stripe is the sum over its columns of `d_j / ((0xFFFF - r) XOR j)`, a Cauchy
+matrix: any `m` parity blocks of a stripe rebuild any `m` missing data blocks of it. Every stripe spans all pages, so a
+lost page costs every stripe the same share. Rows and columns must be distinct elements of the field, so a stripe of
+`c` columns has at most `65536 - c` rows: at least three per column for a full stripe of 16384. The last data block is padded with zeros. A reader alternates PaperBack's
+recovery blocks and the parity blocks as long as either rebuilds blocks.
+
+The rows and the missing columns form a Cauchy matrix `1 / (x_i + y_j)` (`x = 0xFFFF - r`, `y = j`), whose inverse has a
+closed form: with `A(t)` the product of `t + x_i` over the rows used and `B(t)` that of `t + y_j` over the missing
+columns, missing column `j` is the sum over the rows of `B(x_i) A(y_j) / ((x_i + y_j) A'(x_i) B'(y_j))` times what row
+`i` holds less the known columns. A reader uses the lowest rows it has; if it read one row more, it checks the rebuilt
+blocks against it and rebuilds nothing from that stripe if they do not fit, since one of the parity blocks is then not
+what its address says. It takes no parity block beyond the number the sheet records give for the file, and neither copy
+of a parity block read twice with different contents.
+
+The sheet record says where the parity blocks of the page are (see "Extension records"). A reader needs no record to
+use parity blocks, only to check that they were read in the right cell and that the file has them.
+
 ## Data stream
 
 file -> bzip2 (optional; kept only if smaller) -> zero padding to 16 bytes -> CRC-16 stored in the
@@ -60,7 +100,7 @@ A record is 90 bytes: `PBX1`, a kind byte, a version byte (1), then the body, ze
 
 | Kind | Address `n` | Body |
 |---|---|---|
-| 1, sheet | 0 | sheet identifier (16 bytes), page, page count, columns, rows (each 2 bytes, little endian), group size (1 byte) |
+| 1, sheet | 0 | sheet identifier (16 bytes), page, page count, columns, rows (each 2 bytes, little endian), group size (1 byte, 0 without recovery blocks), first parity block of the page, parity blocks on the page, parity blocks of the file (each 4 bytes) |
 | 2, hash | 1 | check value (32 bytes), size of the original file (4 bytes), keyed flag (1 byte) |
 | 3, parity | 2 | the bytes after the header of the sheet record and of the hash record, added up without carry (XOR) |
 

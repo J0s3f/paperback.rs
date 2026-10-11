@@ -107,6 +107,9 @@ struct Reading<'a> {
     label: Option<SuperBlock>,
     /// Blocks read from other pictures of the same sheet.
     sheets: &'a Sheets,
+    /// Whether the passes of more effort are left out once the parity blocks read cover the
+    /// blocks that are missing.
+    parity_suffices: bool,
 }
 
 /// Share of a block's size within which a block read before counts as the one in this cell.
@@ -145,14 +148,31 @@ fn scan_bitmap(raster: &Raster, reading: &Reading, reduced_by: usize) -> Result<
         in_original,
         SAME_BLOCK_SHARE * block_size,
     );
-    // Then passes of more effort over the blocks that are still missing, and only those.
+    // The cells the first pass could not read: a block read there later took more effort.
+    let failed_first: Vec<bool> = outcomes
+        .iter()
+        .map(|outcome| matches!(outcome, BlockOutcome::Missing | BlockOutcome::Unreadable))
+        .collect();
+    // Then passes of more effort over the blocks that are still missing, and only those, unless
+    // the parity blocks read already cover them.
+    let mut parity_shortcut = false;
     for effort in [Effort::Normal, Effort::Deep] {
+        if reading.parity_suffices && outcomes_covered_by_parity(&outcomes, reading.label.as_ref())
+        {
+            parity_shortcut = true;
+            break;
+        }
         reader.set_effort(effort);
         if effort == Effort::Deep {
             train_detector(&mut reader, &mut outcomes, columns);
         }
         follow_bent_paper(&mut reader, &mut outcomes, columns, rows);
     }
+    let read_late: Vec<bool> = outcomes
+        .iter()
+        .zip(&failed_first)
+        .map(|(outcome, &failed)| failed && matches!(outcome, BlockOutcome::Readable { .. }))
+        .collect();
     let collected = collect(
         outcomes,
         columns,
@@ -166,22 +186,21 @@ fn scan_bitmap(raster: &Raster, reading: &Reading, reduced_by: usize) -> Result<
         // A picture that shows no label block but is found to show a sheet read before.
         .or_else(|| sheet.map(|(index, _)| reading.sheets.label_of(index)))
         .ok_or(Error::NoReadablePage)?;
-    let quality = wanted.quality.then(|| {
-        PageQuality::new(
-            raster.clone(),
-            reader.grid(),
-            columns,
-            rows,
-            collected.cells,
-            reader.shift_map(),
-            reader.cell_quads(),
-        )
-    });
+    let quality = cell_quality(
+        &mut reader,
+        wanted.quality.then(|| raster.clone()),
+        collected.cells,
+        in_original,
+        (SAME_BLOCK_SHARE * block_size, read_late),
+    );
+    let mut statistics = collected.statistics;
+    statistics.bad_blocks = quality.unreadable_blocks();
+    statistics.effort_blocks = quality.blocks_read_with_effort();
     let mut page = ScannedPage {
         label,
         group_size: collected.group_size,
         blocks: collected.blocks,
-        statistics: collected.statistics,
+        statistics,
         read_places: collected.read_places,
         block_size,
         lattice: LatticeRead {
@@ -191,13 +210,45 @@ fn scan_bitmap(raster: &Raster, reading: &Reading, reduced_by: usize) -> Result<
             sheet,
         },
         records: Vec::new(),
-        quality,
+        quality: Some(quality),
+        reads: collected.reads,
+        parity_shortcut,
+        corrections: collected.corrections,
     };
     // A reduced picture shows nothing of the scanner's settings; the caller looks at the original.
     if reduced_by == 1 {
         attach_hints(&mut page, raster, dot_pitch(&reader.grid()), wanted);
     }
     Ok(page)
+}
+
+/// The cells of a reading as read, for the counts of the page and for adding other readings of the
+/// picture to them: `in_original` places a point of the reading in the picture the caller gave, and
+/// a block within `reach` of the middle of a cell is its block; `read_late` tells the cells read only
+/// in the passes after the first. The picture and the corners of the blocks, which take the grid
+/// lines of the whole page to trace, only when the quality is to be drawn (`picture`).
+fn cell_quality(
+    reader: &mut BlockReader,
+    picture: Option<Raster>,
+    cells: Vec<BlockQuality>,
+    in_original: impl Fn((f64, f64)) -> (f64, f64),
+    (reach, read_late): (f64, Vec<bool>),
+) -> PageQuality {
+    let (columns, rows) = (reader.columns(), reader.rows());
+    let shifts = reader.shift_map();
+    let centres: Vec<(f64, f64)> = (0..columns * rows)
+        .map(|at| {
+            let (centre, shift) = (reader.cell_centre(at % columns, at / columns), shifts[at]);
+            in_original((centre.0 + shift.0, centre.1 + shift.1))
+        })
+        .collect();
+    let quads = if picture.is_some() {
+        reader.cell_quads()
+    } else {
+        None
+    };
+    PageQuality::new(picture, reader.grid(), columns, rows, cells, shifts, quads)
+        .with_placed_cells(centres, reach, read_late)
 }
 
 /// Blocks read in the first look at a picture; more would only cost time.
@@ -241,6 +292,9 @@ fn look_for_sheet(
         return (look.outcomes, None);
     }
     reader.set_effort(Effort::Normal);
+    // A few blocks that only tell which sheet this is are not worth building the corner mesh of
+    // the page; whatever does not read here is read with it in the passes that follow.
+    reader.allow_meshes(false);
     let read_unknown = |reader: &mut BlockReader, look: &mut FirstLook, cell: (usize, usize)| {
         let place = in_original(reader.cell_centre(cell.0, cell.1));
         if !reading.known.is_near(place, same_block_within) {
@@ -261,6 +315,7 @@ fn look_for_sheet(
         }
         sheet = reading.sheets.recognise(&look.samples, look.shown_id);
     }
+    reader.allow_meshes(true);
     reader.set_effort(Effort::Quick);
     (look.outcomes, sheet)
 }
@@ -269,6 +324,8 @@ fn look_for_sheet(
 /// block was read already: in an earlier reading of this picture, or in another picture of the
 /// sheet. A first look at a few cells says whether other pictures of the sheet were read and
 /// how their cells relate to these. Also returns the sheet the picture was found to show.
+/// When the quality is wanted the cells known from other pictures are read as well: the map
+/// shows how each cell reads in this picture, not whether its block is known from elsewhere.
 fn quick_pass(
     reader: &mut BlockReader,
     reading: &Reading,
@@ -292,7 +349,8 @@ fn quick_pass(
             outcomes.push(if let Some(done) = first_look[at].take() {
                 done
             } else if reading.known.is_near(place, same_block_within)
-                || known_in_sheet.as_ref().is_some_and(|known| known[at])
+                || (!reading.wanted.quality
+                    && known_in_sheet.as_ref().is_some_and(|known| known[at]))
             {
                 BlockOutcome::Skipped
             } else {
@@ -325,6 +383,10 @@ struct Collected {
     read_places: Vec<(f64, f64)>,
     /// The key of the block read in each cell.
     keys: Vec<Option<BlockKey>>,
+    /// Bytes corrected in each data and recovery block read, by [`ScannedBlock::identity`].
+    corrections: HashMap<(bool, u32), usize>,
+    /// Every cell that read: where it lies in the original picture, and the bytes corrected.
+    reads: Vec<((f64, f64), usize)>,
 }
 
 /// Sorts the blocks that were read into data, recovery and label, and counts the rest.
@@ -344,11 +406,14 @@ fn collect(
         cells: Vec::with_capacity(outcomes.len()),
         read_places: Vec::new(),
         keys: Vec::with_capacity(outcomes.len()),
+        corrections: HashMap::new(),
+        reads: Vec::new(),
     };
     for (at, outcome) in outcomes.into_iter().enumerate() {
         let (column, row) = (at % columns, at / columns);
         collected.cells.push(match &outcome {
-            BlockOutcome::Missing | BlockOutcome::Skipped => BlockQuality::Absent,
+            BlockOutcome::Missing => BlockQuality::Absent,
+            BlockOutcome::Skipped => BlockQuality::Known,
             BlockOutcome::Unreadable => BlockQuality::Unreadable,
             BlockOutcome::Readable { corrected, .. } => BlockQuality::Readable(*corrected),
         });
@@ -357,14 +422,18 @@ fn collect(
             _ => None,
         });
         match outcome {
-            BlockOutcome::Missing => {}
+            // Unreadable blocks are counted with the quality, which also counts the cells between
+            // blocks that lost even their grid lines.
+            BlockOutcome::Missing | BlockOutcome::Unreadable => {}
             // A block known from elsewhere: a later reading need not read this place either.
             BlockOutcome::Skipped => collected.read_places.push(centre_of(column, row)),
-            BlockOutcome::Unreadable => collected.statistics.bad_blocks += 1,
             BlockOutcome::Readable { block, corrected } => {
-                collected.read_places.extend(place_of(column, row));
+                let place = place_of(column, row);
+                collected.read_places.extend(place);
+                let place = place.unwrap_or_else(|| centre_of(column, row));
+                collected.reads.push((place, corrected));
                 collected.statistics.restored_bytes += corrected;
-                collected.sort_block(&block);
+                collected.sort_block(&block, corrected);
             }
         }
     }
@@ -383,7 +452,7 @@ fn block_key(block: &RawBlock) -> Option<BlockKey> {
 }
 
 impl Collected {
-    fn sort_block(&mut self, block: &RawBlock) {
+    fn sort_block(&mut self, block: &RawBlock, corrected: usize) {
         match BlockKind::of(block.address()) {
             BlockKind::Superblock => {
                 let candidate = SuperBlock::from_raw(block);
@@ -393,6 +462,7 @@ impl Collected {
                 self.statistics.superblocks += 1;
             }
             BlockKind::Data { offset } => {
+                self.note_corrections((false, offset), corrected);
                 self.statistics.good_blocks += 1;
                 self.blocks.push(ScannedBlock::Data {
                     offset,
@@ -400,6 +470,7 @@ impl Collected {
                 });
             }
             BlockKind::Recovery { offset, group_size } => {
+                self.note_corrections((true, offset), corrected);
                 self.statistics.good_blocks += 1;
                 self.group_size = group_size;
                 self.blocks.push(ScannedBlock::Recovery {
@@ -409,6 +480,12 @@ impl Collected {
                 });
             }
         }
+    }
+
+    /// Keeps the fewest corrections a block was read with, when it was read in several cells.
+    fn note_corrections(&mut self, identity: (bool, u32), corrected: usize) {
+        let least = self.corrections.entry(identity).or_insert(corrected);
+        *least = (*least).min(corrected);
     }
 }
 
@@ -718,24 +795,7 @@ const PROBE_ROWS: usize = 4;
 /// be rebuilt: a group of blocks survives the loss of one block if its recovery
 /// block is there.
 fn reads_cleanly(page: &ScannedPage) -> bool {
-    let label = &page.label;
-    let page_size = label.page_size as usize;
-    let before = usize::from(label.page)
-        .saturating_sub(1)
-        .saturating_mul(page_size);
-    let on_page = (label.data_size as usize)
-        .saturating_sub(before)
-        .min(page_size);
-    let first = before / crate::block::DATA_LEN;
-    let data_blocks = on_page.div_ceil(crate::block::DATA_LEN);
-    let data_read: HashSet<usize> = page
-        .blocks
-        .iter()
-        .filter_map(|block| match block {
-            ScannedBlock::Data { offset, .. } => Some(*offset as usize / crate::block::DATA_LEN),
-            ScannedBlock::Recovery { .. } => None,
-        })
-        .collect();
+    let data_read: HashSet<usize> = page.blocks.iter().filter_map(file_block_index).collect();
     let recovery_groups: HashSet<usize> = page
         .blocks
         .iter()
@@ -747,7 +807,7 @@ fn reads_cleanly(page: &ScannedPage) -> bool {
         })
         .collect();
     let mut missing_per_group: HashMap<usize, usize> = HashMap::new();
-    for index in (first..first + data_blocks).filter(|index| !data_read.contains(index)) {
+    for index in own_blocks(&page.label).filter(|index| !data_read.contains(index)) {
         let group = match page.group_size {
             0 => index,
             size => index / size,
@@ -756,6 +816,161 @@ fn reads_cleanly(page: &ScannedPage) -> bool {
     }
     missing_per_group.iter().all(|(group, &missing)| {
         page.group_size > 0 && missing == 1 && recovery_groups.contains(group)
+    })
+}
+
+/// The data blocks of the file that the page with this label carries; none for a page beyond
+/// the end of the file, which [`label_is_plausible`] does not let through.
+fn own_blocks(label: &SuperBlock) -> std::ops::Range<usize> {
+    let page_size = label.page_size as usize;
+    let before = usize::from(label.page)
+        .saturating_sub(1)
+        .saturating_mul(page_size);
+    let on_page = (label.data_size as usize)
+        .saturating_sub(before)
+        .min(page_size);
+    let first = before / crate::block::DATA_LEN;
+    first..first + on_page.div_ceil(crate::block::DATA_LEN)
+}
+
+/// Whether the page lacks none of its data blocks, so that no other reading can add to it.
+fn lacks_nothing(page: &ScannedPage) -> bool {
+    let data_read: HashSet<usize> = page.blocks.iter().filter_map(file_block_index).collect();
+    own_blocks(&page.label).all(|index| data_read.contains(&index))
+}
+
+/// Which data block of the file a block read is, by its address; `None` for a recovery block
+/// and for a parity block, whose address lies between those of data blocks and would otherwise
+/// pass for the one before it.
+fn file_block_index(block: &ScannedBlock) -> Option<usize> {
+    match *block {
+        ScannedBlock::Data { offset, .. } if crate::parity::index_of(offset).is_none() => {
+            Some(offset as usize / crate::block::DATA_LEN)
+        }
+        ScannedBlock::Data { .. } | ScannedBlock::Recovery { .. } => None,
+    }
+}
+
+/// Whether the page leaves nothing to read for checking the file: it announces no PBX1 records
+/// (pages of the originals, `--legacy`, `--no-extensions`), or a hash record that the file will be
+/// checked against was read or can be rebuilt from its sheet and parity records. A page that stops
+/// early must not lose the hash.
+fn integrity_settled(label: &SuperBlock, blocks: &[ScannedBlock]) -> bool {
+    if !label.mode.is_extended() {
+        return true;
+    }
+    let records: Vec<Record> = blocks
+        .iter()
+        .filter_map(|block| block.record(label.data_size))
+        .collect();
+    pbx::with_missing_rebuilt(records)
+        .iter()
+        .any(|record| matches!(record, Record::Hash(hash) if assemble::hash_fits(label, hash)))
+}
+
+/// Whether the data blocks of the page that are neither read nor rebuilt from a recovery block
+/// are covered by the parity blocks read on the page: in every stripe at least as many parity
+/// blocks as missing data blocks. If every page covers its own losses so, the parity blocks of
+/// all pages rebuild the file. A page that lacks nothing is covered without any parity block:
+/// the passes of more effort would only try the empty cells around its blocks, and follow
+/// the grid lines of the whole page to do so.
+fn covered_by_parity(page: &ScannedPage) -> bool {
+    blocks_covered_by_parity(&page.label, page.group_size, &page.blocks)
+}
+
+/// [`covered_by_parity`] for the blocks of a page with this label and group size.
+fn blocks_covered_by_parity(
+    label: &SuperBlock,
+    group_size: usize,
+    blocks: &[ScannedBlock],
+) -> bool {
+    let code =
+        crate::parity::Code::new((label.data_size as usize).div_ceil(crate::block::DATA_LEN));
+    let mut parity_per_stripe = vec![0usize; code.stripes()];
+    // A parity block read in two cells (a grid one cell off) counts once, as for the assembler.
+    let mut parity_read = HashSet::new();
+    let mut data_read = HashSet::new();
+    let mut recovery_groups = HashSet::new();
+    for block in blocks {
+        match *block {
+            ScannedBlock::Data { offset, .. } => match crate::parity::index_of(offset) {
+                Some(index) => {
+                    if let Some(stripe) = code.stripe_of_parity(index)
+                        && parity_read.insert(index)
+                    {
+                        parity_per_stripe[stripe] += 1;
+                    }
+                }
+                None => {
+                    data_read.insert(offset as usize / crate::block::DATA_LEN);
+                }
+            },
+            ScannedBlock::Recovery {
+                offset, group_size, ..
+            } => {
+                recovery_groups.insert(offset as usize / (group_size * crate::block::DATA_LEN));
+            }
+        }
+    }
+    let mut missing_per_group: HashMap<usize, Vec<usize>> = HashMap::new();
+    for index in own_blocks(label).filter(|index| !data_read.contains(index)) {
+        let group = match group_size {
+            0 => usize::MAX - index,
+            size => index / size,
+        };
+        missing_per_group.entry(group).or_default().push(index);
+    }
+    let mut missing_per_stripe = vec![0usize; code.stripes()];
+    for (group, missing) in &missing_per_group {
+        let rebuilt = group_size > 0 && missing.len() == 1 && recovery_groups.contains(group);
+        if !rebuilt {
+            for &index in missing {
+                missing_per_stripe[index % code.stripes()] += 1;
+            }
+        }
+    }
+    missing_per_stripe
+        .iter()
+        .zip(&parity_per_stripe)
+        .all(|(missing, parity)| missing <= parity)
+}
+
+/// Whether the blocks read so far in one reading of a page leave nothing to the passes of more
+/// effort: its parity blocks cover what is missing. `label` is the label of an earlier reading.
+fn outcomes_covered_by_parity(outcomes: &[BlockOutcome], label: Option<&SuperBlock>) -> bool {
+    let mut found_label = None;
+    let mut group_size = 0;
+    let mut blocks = Vec::new();
+    for outcome in outcomes {
+        let BlockOutcome::Readable { block, .. } = outcome else {
+            continue;
+        };
+        match BlockKind::of(block.address()) {
+            BlockKind::Superblock => {
+                let candidate = SuperBlock::from_raw(block);
+                if label_is_plausible(&candidate) {
+                    found_label = Some(candidate);
+                }
+            }
+            BlockKind::Data { offset } => blocks.push(ScannedBlock::Data {
+                offset,
+                payload: block.payload_array(),
+            }),
+            BlockKind::Recovery {
+                offset,
+                group_size: size,
+            } => {
+                group_size = size;
+                blocks.push(ScannedBlock::Recovery {
+                    offset,
+                    group_size: size,
+                    payload: block.payload_array(),
+                });
+            }
+        }
+    }
+    found_label.as_ref().or(label).is_some_and(|label| {
+        blocks_covered_by_parity(label, group_size, &blocks) && integrity_settled(label, &blocks)
     })
 }
 
@@ -776,6 +991,14 @@ fn known_blocks(page: Option<&ScannedPage>) -> KnownBlocks {
 struct Readings {
     combined: Option<ScannedPage>,
     last_error: Option<Error>,
+    /// Whether a page that lacks blocks counts as complete when its parity blocks cover them.
+    parity_suffices: bool,
+    /// Whether a page counts as complete only when it lacks no data block, not already when its
+    /// recovery blocks would rebuild the missing ones: for a page read again because the file
+    /// lacks blocks, where that may not have held.
+    thorough: bool,
+    /// Whether the readings stopped before every attempt was made.
+    stopped_early: bool,
 }
 
 impl Readings {
@@ -790,9 +1013,20 @@ impl Readings {
                     }
                     None => page,
                 };
-                let complete = reads_cleanly(&merged);
+                let complete = if self.thorough {
+                    lacks_nothing(&merged)
+                } else {
+                    reads_cleanly(&merged)
+                };
+                let stopped_on_parity = !complete
+                    && self.parity_suffices
+                    && (merged.parity_shortcut
+                        || (covered_by_parity(&merged)
+                            && integrity_settled(&merged.label, &merged.blocks)));
+                self.stopped_early = (merged.parity_shortcut || complete || stopped_on_parity)
+                    && !lacks_nothing(&merged);
                 self.combined = Some(merged);
-                complete
+                complete || stopped_on_parity
             }
             Err(error) => {
                 self.last_error = Some(error);
@@ -801,8 +1035,12 @@ impl Readings {
         }
     }
 
-    fn into_result(self) -> Result<ScannedPage> {
+    /// The page, and whether its readings stopped with blocks missing before every attempt was
+    /// made: because its parity blocks or its recovery blocks seemed to cover them.
+    fn into_result(self) -> Result<(ScannedPage, bool)> {
+        let stopped_early = self.stopped_early;
         self.combined
+            .map(|page| (page, stopped_early))
             .ok_or_else(|| self.last_error.unwrap_or(Error::NoReadablePage))
     }
 }
@@ -810,9 +1048,24 @@ impl Readings {
 /// Reads one page image into blocks and their statistics. When the page does
 /// not read completely as it is, it is turned and read again; blocks found in
 /// any attempt are combined. A turned picture is read only where no block was read
-/// before, and nothing that was read is ever dropped.
-fn scan_page(raster: &Raster, wanted: Wanted, sheets: &Sheets) -> Result<ScannedPage> {
-    let mut readings = Readings::default();
+/// before, and nothing that was read is ever dropped. A first reading (`thorough` false) needs no
+/// further attempts once the recovery blocks or the parity blocks read on the page cover the
+/// blocks that are missing; the second value tells whether it stopped so, with blocks missing. The
+/// parity blocks do not count when the quality is wanted: then every cell gets every attempt,
+/// also where they would rebuild its block, since the quality shows the page and not what the file
+/// needs. A `thorough` reading stops only when the page lacks no block.
+fn scan_page(
+    raster: &Raster,
+    wanted: Wanted,
+    sheets: &Sheets,
+    thorough: bool,
+) -> Result<(ScannedPage, bool)> {
+    let parity_suffices = !thorough && !wanted.quality;
+    let mut readings = Readings {
+        parity_suffices,
+        thorough,
+        ..Readings::default()
+    };
     let nothing_known = KnownBlocks::default();
     let first = Reading {
         wanted,
@@ -820,6 +1073,7 @@ fn scan_page(raster: &Raster, wanted: Wanted, sheets: &Sheets) -> Result<Scanned
         known: &nothing_known,
         label: None,
         sheets,
+        parity_suffices,
     };
     if readings.add(scan_bitmap(raster, &first, 1)) {
         return readings.into_result();
@@ -841,6 +1095,7 @@ fn scan_page(raster: &Raster, wanted: Wanted, sheets: &Sheets) -> Result<Scanned
             known: &known,
             label: readings.combined.as_ref().map(|page| page.label.clone()),
             sheets,
+            parity_suffices,
         };
         if readings.add(scan_bitmap(&turned, &turned_reading, 1)) {
             break;
@@ -850,12 +1105,16 @@ fn scan_page(raster: &Raster, wanted: Wanted, sheets: &Sheets) -> Result<Scanned
 }
 
 /// A label that passes its CRC can still be garbage or hostile; sizes beyond what
-/// the format can address would only make the assembler allocate absurd amounts.
+/// the format can address would only make the assembler allocate absurd amounts, and a page
+/// beyond the end of the data would carry no data block, so that it would seem to lack none.
 fn label_is_plausible(label: &SuperBlock) -> bool {
     let limit = MAX_FILE_SIZE as usize + crate::codec::ALIGNMENT;
-    (1..=limit).contains(&(label.data_size as usize))
+    let data_size = label.data_size as usize;
+    (1..=limit).contains(&data_size)
         && label.original_size as usize <= limit
         && label.page >= 1
+        && label.page_size > 0
+        && (usize::from(label.page) - 1).saturating_mul(label.page_size as usize) < data_size
 }
 
 /// What the caller learns about each page while decoding.
@@ -875,6 +1134,9 @@ pub struct DecodeOptions {
     /// Needed only for encrypted backups.
     pub password: Option<String>,
     /// Keep the block quality of every page (see [`PageOutcome::quality`]); costs a copy of each page.
+    /// Every picture is then read in full, also after the file is complete and where another
+    /// picture of the sheet showed a block already, so that the quality shows how each picture
+    /// was printed and scanned; this is slower.
     pub quality: bool,
     /// Look at pages that read badly for likely causes (see [`PageStatistics::hints`]); costs a
     /// pass over the pixels of each such page.
@@ -896,11 +1158,20 @@ pub fn decode(
     options: &DecodeOptions,
     mut on_page: impl FnMut(PageOutcome),
 ) -> Result<RestoredFile> {
-    let mut assembler = Assembler::new();
+    let mut assembler = Assembler::with_threads(options.threads);
     let mut sheets = Sheets::default();
+    let wanted = Wanted {
+        quality: options.quality,
+        diagnose: options.diagnose,
+        threads: options.threads,
+    };
+    // Pages whose readings stopped with blocks missing because their recovery or parity blocks
+    // seemed to cover them, with their counts.
+    let mut stopped_early = Vec::new();
     for (index, raster) in pages.iter().enumerate() {
-        // Pictures after the one that completed the file are not read at all.
-        if assembler.is_complete() {
+        // Pictures after the one that completed the file are not read at all, unless their
+        // quality is wanted.
+        if assembler.is_complete() && !options.quality {
             on_page(PageOutcome {
                 index,
                 result: Err("not read: the file is complete already".into()),
@@ -908,30 +1179,43 @@ pub fn decode(
             });
             continue;
         }
-        match scan_page(
-            raster,
-            Wanted {
-                quality: options.quality,
-                diagnose: options.diagnose,
-                threads: options.threads,
-            },
-            &sheets,
-        ) {
-            Ok(mut page) => {
+        match scan_page(raster, wanted, &sheets, false) {
+            Ok((mut page, stopped)) => {
                 positions::examine(&mut page);
                 sheets.record(&page.lattice, &page.label, page.statistics.sheet_id);
                 on_page(PageOutcome {
                     index,
                     result: Ok(page.statistics),
-                    quality: page.quality.take(),
+                    // Every reading keeps its cells; the caller gets them only if it asked.
+                    quality: if options.quality {
+                        page.quality.take()
+                    } else {
+                        None
+                    },
                 });
                 assembler.add_page(&page);
+                if stopped {
+                    stopped_early.push((index, page.statistics));
+                }
             }
             Err(error) => on_page(PageOutcome {
                 index,
                 result: Err(error.to_string()),
                 quality: None,
             }),
+        }
+    }
+    // The parity or recovery blocks did not suffice after all (a page is missing, a recovery block
+    // turned out to be in the wrong cell, two pages tell different group sizes): the pages that
+    // stopped early are read with every attempt for the blocks that are still missing.
+    for (index, earlier) in stopped_early {
+        if assembler.is_complete() {
+            break;
+        }
+        if let Ok((mut page, _)) = scan_page(&pages[index], wanted, &sheets, true) {
+            positions::examine(&mut page);
+            sheets.record(&page.lattice, &page.label, page.statistics.sheet_id);
+            assembler.add_more_blocks(&page, &earlier);
         }
     }
     let restored = assembler.finish(options.password.as_deref())?;
@@ -950,6 +1234,167 @@ mod tests {
     use crate::layout::{PageLayout, PageSetup};
 
     const FILE_LEN: usize = 3000;
+
+    /// A page of a file of ten data blocks holding the data blocks `data` and the parity blocks
+    /// `parity`.
+    fn page_holding(data: &[usize], parity: &[usize]) -> ScannedPage {
+        use crate::block::{FileTime, Mode, NAME_LEN};
+        let block = |offset: u32| ScannedBlock::Data {
+            offset,
+            payload: [0; DATA_LEN],
+        };
+        ScannedPage {
+            label: SuperBlock {
+                data_size: 10 * DATA_LEN as u32,
+                page_size: 10 * DATA_LEN as u32,
+                original_size: 10 * DATA_LEN as u32,
+                mode: Mode(0),
+                attributes: 0,
+                page: 1,
+                modified: FileTime::default(),
+                file_crc: 0,
+                name: [0; NAME_LEN],
+            },
+            group_size: 0,
+            blocks: data
+                .iter()
+                .map(|&i| block((i * DATA_LEN) as u32))
+                .chain(parity.iter().map(|&k| block(crate::parity::address(k))))
+                .collect(),
+            statistics: PageStatistics::default(),
+            read_places: Vec::new(),
+            block_size: 0.0,
+            lattice: LatticeRead::default(),
+            records: Vec::new(),
+            quality: None,
+            reads: Vec::new(),
+            parity_shortcut: false,
+            corrections: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_parity_block_read_in_two_cells_counts_once() {
+        // A grid one cell off can read a block in two cells. Counted twice, one parity block
+        // covered two lost blocks, and the page stopped short of what the file needs.
+        let eight = [0, 1, 2, 3, 5, 6, 8, 9];
+        assert!(!covered_by_parity(&page_holding(&eight, &[4, 4])));
+        let label = page_holding(&[], &[]).label;
+        let blocks = page_holding(&eight, &[4, 4]).blocks;
+        assert!(!blocks_covered_by_parity(&label, 0, &blocks));
+    }
+
+    #[test]
+    fn a_page_beyond_the_end_of_the_file_is_not_taken() {
+        // Such a page carries no data block, so it lacked none and needed no effort.
+        let label = page_holding(&[], &[]).label;
+        assert!(label_is_plausible(&label));
+        for (page, page_size) in [(2, label.page_size), (0xFFFF, label.page_size), (1, 0)] {
+            let beyond = SuperBlock {
+                page_size,
+                page,
+                ..label.clone()
+            };
+            assert!(!label_is_plausible(&beyond), "page {page}");
+        }
+        let half = SuperBlock {
+            page: 2,
+            page_size: label.data_size / 2,
+            ..label.clone()
+        };
+        assert!(label_is_plausible(&half));
+    }
+
+    #[test]
+    fn only_a_hash_that_will_check_the_file_settles_its_integrity() {
+        // A hash record of another size, or keyed for a file that is not encrypted, is not used to
+        // check the file; once a page stopped early on it and the hash went unread.
+        let mut label = page_holding(&[], &[]).label;
+        label.mode = crate::block::Mode(crate::block::Mode::EXTENDED);
+        let hash = pbx::HashRecord {
+            digest: [1; pbx::HASH_LEN],
+            original_size: label.original_size,
+            keyed: false,
+        };
+        let holding = |hash: pbx::HashRecord| {
+            vec![ScannedBlock::Data {
+                offset: pbx::record_address(label.data_size, 1).unwrap(),
+                payload: Record::Hash(hash).to_payload(),
+            }]
+        };
+        assert!(integrity_settled(&label, &holding(hash)));
+        let other_size = pbx::HashRecord {
+            original_size: hash.original_size + 1,
+            ..hash
+        };
+        assert!(!integrity_settled(&label, &holding(other_size)));
+        let keyed = pbx::HashRecord {
+            keyed: true,
+            ..hash
+        };
+        assert!(!integrity_settled(&label, &holding(keyed)));
+    }
+
+    #[test]
+    fn a_page_that_stops_on_its_recovery_blocks_is_read_again_if_the_file_lacks_blocks() {
+        // Block 3 is missing, and the recovery block of its group would rebuild it, so the page
+        // stops early. Should the file still lack blocks (the recovery block was in the wrong
+        // cell, say), it is read again, and then only a page that lacks nothing stops.
+        let mut page = page_holding(&[0, 1, 2, 4, 5, 6, 7, 8, 9], &[]);
+        page.group_size = 5;
+        page.blocks.push(ScannedBlock::Recovery {
+            offset: 0,
+            group_size: 5,
+            payload: [0; DATA_LEN],
+        });
+        let first_reading = |page: ScannedPage| {
+            let mut readings = Readings {
+                parity_suffices: true,
+                ..Readings::default()
+            };
+            (readings.add(Ok(page)), readings.into_result().unwrap().1)
+        };
+        assert_eq!(first_reading(page_copy(&page)), (true, true));
+        let mut again = Readings {
+            thorough: true,
+            ..Readings::default()
+        };
+        assert!(!again.add(Ok(page_copy(&page))));
+        // A page that lacks nothing stops, and needs no other reading.
+        let complete = page_holding(&(0..10).collect::<Vec<_>>(), &[]);
+        assert_eq!(first_reading(complete), (true, false));
+    }
+
+    fn page_copy(page: &ScannedPage) -> ScannedPage {
+        let mut copy = page_holding(&[], &[]);
+        copy.group_size = page.group_size;
+        copy.blocks = page
+            .blocks
+            .iter()
+            .map(|block| match *block {
+                ScannedBlock::Data { offset, payload } => ScannedBlock::Data { offset, payload },
+                ScannedBlock::Recovery {
+                    offset,
+                    group_size,
+                    payload,
+                } => ScannedBlock::Recovery {
+                    offset,
+                    group_size,
+                    payload,
+                },
+            })
+            .collect();
+        copy
+    }
+
+    #[test]
+    fn a_page_is_covered_when_its_parity_blocks_match_its_losses() {
+        let eight = [0, 1, 2, 3, 5, 6, 8, 9];
+        assert!(covered_by_parity(&page_holding(&eight, &[0, 1])));
+        assert!(covered_by_parity(&page_holding(&eight, &[3, 4, 7])));
+        assert!(!covered_by_parity(&page_holding(&eight, &[2])));
+        assert!(!covered_by_parity(&page_holding(&eight, &[])));
+    }
     const GROUP: usize = 5;
 
     #[test]
@@ -962,9 +1407,16 @@ mod tests {
                 ..PageSetup::default()
             },
             compression: Compression::None,
+            // The cells of these pages are those of PaperBack's default layout.
+            redundancy: Some(crate::block::Redundancy::default()),
+            parity_percent: 0,
             ..EncodeOptions::default()
         };
-        let layout = PageLayout::compute(&options.setup, options.redundancy).unwrap();
+        let layout = PageLayout::compute(
+            &options.setup,
+            crate::plan::Strings::new(options.redundancy),
+        )
+        .unwrap();
         let raster = encode(&data, &options).unwrap().remove(0).raster;
 
         // Three neighbouring cells of one string belong to three different groups.
@@ -1005,7 +1457,11 @@ mod tests {
             password: password.map(str::to_owned),
             ..EncodeOptions::default()
         };
-        let layout = PageLayout::compute(&options.setup, options.redundancy).unwrap();
+        let layout = PageLayout::compute(
+            &options.setup,
+            crate::plan::Strings::new(options.redundancy),
+        )
+        .unwrap();
         let raster = encode(&data, &options).unwrap().remove(0).raster;
         let bands = layout.text.map_or(0, |t| t.top_band() + t.bottom_band());
         let rows = (1..=layout.ny)
@@ -1041,6 +1497,293 @@ mod tests {
             assert_eq!(file.data, data);
             assert_eq!(file.report.integrity, crate::Integrity::Verified);
         }
+    }
+
+    /// Readable cells in the quality of each picture, `None` for a picture without one.
+    fn readable_cells(pages: &[Raster]) -> Vec<Option<usize>> {
+        let options = DecodeOptions {
+            quality: true,
+            ..DecodeOptions::default()
+        };
+        let mut cells = vec![None; pages.len()];
+        let _ = decode(pages, &options, |page| {
+            cells[page.index] = page.quality.map(|q| q.readable_blocks());
+        });
+        cells
+    }
+
+    #[test]
+    fn the_quality_of_a_second_picture_of_a_sheet_covers_the_cells_read_in_the_first() {
+        // The first page of two: the file stays incomplete, so every picture is read.
+        let (raster, layout, rows) = full_page();
+        let alone = readable_cells(std::slice::from_ref(&raster))[0].unwrap();
+        assert_eq!(alone, layout.nx * rows);
+        let damaged = wiped_column(raster.clone(), &layout, rows, 5, false);
+        let cells = readable_cells(&[damaged, raster]);
+        assert_eq!(cells[0], Some(alone - rows));
+        // The second picture shows the same sheet; its cells read in the first count all the same.
+        assert_eq!(cells[1], Some(alone));
+    }
+
+    #[test]
+    fn pictures_after_the_file_is_complete_get_their_quality() {
+        let (_, raster, ..) = small_page();
+        let cells = readable_cells(&[raster.clone(), raster.clone()]);
+        assert_eq!(cells[1], cells[0]);
+        assert!(cells[1].is_some());
+        // Without the quality the second picture is not read at all.
+        let mut read = Vec::new();
+        decode(
+            &[raster.clone(), raster],
+            &DecodeOptions::default(),
+            |page| {
+                read.push(page.result.is_ok());
+            },
+        )
+        .unwrap();
+        assert_eq!(read, [true, false]);
+    }
+
+    /// The first of the pages of a file that fills it, at two pixels per dot as from a 300 dpi
+    /// printer; the geometry to find its cells, and its rows.
+    fn full_page() -> (Raster, PageLayout, usize) {
+        full_page_with(EncodeOptions::default())
+    }
+
+    /// [`full_page`] with the redundancy, parity and filling of `base`.
+    fn full_page_with(base: EncodeOptions) -> (Raster, PageLayout, usize) {
+        let mut state = 7u32;
+        let data: Vec<u8> = (0..150_000)
+            .map(|_| {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (state >> 16) as u8
+            })
+            .collect();
+        let options = EncodeOptions {
+            setup: PageSetup {
+                printer_dpi: 300,
+                dot_dpi: 200,
+                ..PageSetup::default()
+            },
+            compression: Compression::None,
+            ..base
+        };
+        let layout = PageLayout::compute(
+            &options.setup,
+            crate::plan::Strings::new(options.redundancy),
+        )
+        .unwrap();
+        let raster = encode(&data, &options).unwrap().remove(0).raster;
+        let bands = layout.text.map_or(0, |t| t.top_band() + t.bottom_band());
+        let rows = (1..=layout.ny)
+            .find(|&rows| layout.image_height(rows) + bands == raster.height())
+            .unwrap();
+        (raster, layout, rows)
+    }
+
+    /// Whitens the cells of one column from the top to the bottom of the page, the dots only
+    /// or with the grid lines around them.
+    fn wiped_column(
+        raster: Raster,
+        layout: &PageLayout,
+        rows: usize,
+        column: usize,
+        lines: bool,
+    ) -> Raster {
+        let (width, height) = (raster.width(), raster.height());
+        let mut pixels = raster.into_pixels();
+        let top_band = layout.text.map_or(0, |text| text.top_band());
+        let (x, _) = layout.cell_origin(column);
+        let (x, cell_width) = if lines {
+            (x - 2 * layout.dx, crate::layout::CELL_DOTS * layout.dx + 1)
+        } else {
+            (x, 32 * layout.dx)
+        };
+        let top = top_band + layout.cell_origin(column).1 - 2 * layout.dy;
+        for row in top..top + rows * crate::layout::CELL_DOTS * layout.dy {
+            pixels[row * width + x..row * width + x + cell_width].fill(255);
+        }
+        Raster::from_pixels(width, height, pixels).unwrap()
+    }
+
+    /// The statistics and the readable cells of a single picture.
+    fn read_alone(page: Raster) -> (PageStatistics, usize) {
+        let options = DecodeOptions {
+            quality: true,
+            ..DecodeOptions::default()
+        };
+        let mut seen = None;
+        let _ = decode(&[page], &options, |page| {
+            seen = Some((
+                page.result.unwrap(),
+                page.quality.unwrap().readable_blocks(),
+            ));
+        });
+        seen.unwrap()
+    }
+
+    #[test]
+    fn a_cell_without_dots_does_not_read_the_block_next_to_it() {
+        // A turn of a degree tried for a block far from the corner of the page once moved it
+        // by a whole cell: an empty cell then read its neighbour, as if it were readable.
+        let (raster, layout, rows) = full_page();
+        let page = wiped_column(raster, &layout, rows, 5, false);
+        let (statistics, readable) = read_alone(page);
+        assert_eq!(statistics.bad_blocks, rows);
+        assert_eq!(readable, layout.nx * rows - rows);
+    }
+
+    #[test]
+    fn cells_that_lost_their_grid_lines_between_blocks_count_as_unreadable() {
+        let (raster, layout, rows) = full_page();
+        let page = wiped_column(raster, &layout, rows, 5, true);
+        let (statistics, readable) = read_alone(page);
+        assert_eq!(statistics.bad_blocks, rows);
+        assert!(
+            readable >= layout.nx * rows - rows - 2 * rows,
+            "the columns beside it read"
+        );
+    }
+
+    #[test]
+    fn a_parity_block_is_no_data_block() {
+        // Parity block 0 has the address 1, which divided by 90 is data block 0.
+        let without_the_first: Vec<usize> = (1..10).collect();
+        assert!(!reads_cleanly(&page_holding(&without_the_first, &[0])));
+        let all: Vec<usize> = (0..10).collect();
+        assert!(reads_cleanly(&page_holding(&all, &[0])));
+    }
+
+    #[test]
+    fn a_page_whose_hash_did_not_read_gets_the_passes_of_more_effort() {
+        // Every data block reads at once and parity would cover any loss, but the records at
+        // both ends of the page are gone: stopping early would give up the hash.
+        let (raster, layout, rows) = full_page_with(EncodeOptions::modern());
+        let ends = crate::plan::RECORD_CELLS_PER_END;
+        let last = layout.nx * rows - 1;
+        let records: Vec<usize> = (0..ends).chain(last + 1 - ends..=last).collect();
+        let page = wiped(raster, &layout, &records);
+        let wanted = Wanted {
+            quality: false,
+            diagnose: false,
+            threads: 0,
+        };
+        let (scanned, stopped) = scan_page(&page, wanted, &Sheets::default(), false).unwrap();
+        assert!(!scanned.parity_shortcut && !stopped);
+        // With the records there, the same page does stop early.
+        let (raster, ..) = full_page_with(EncodeOptions::modern());
+        let column = wiped_column(raster, &layout, rows, 5, false);
+        let (scanned, _) = scan_page(&column, wanted, &Sheets::default(), false).unwrap();
+        assert!(scanned.parity_shortcut);
+    }
+
+    #[test]
+    fn a_page_that_lacks_nothing_is_covered_without_parity_blocks() {
+        let all: Vec<usize> = (0..10).collect();
+        assert!(covered_by_parity(&page_holding(&all, &[])));
+        assert!(!covered_by_parity(&page_holding(&all[1..], &[])));
+    }
+
+    #[test]
+    fn a_clean_page_without_parity_blocks_is_not_followed_across_its_margin() {
+        // The grid of a page reaches over the title and the hint, whose cells hold no block. A
+        // page that lacks nothing once needed parity blocks to skip the passes of more effort,
+        // which tried those cells and followed the grid lines of the whole page for them.
+        let (raster, ..) = full_page_with(EncodeOptions::legacy());
+        let wanted = Wanted {
+            quality: false,
+            diagnose: false,
+            threads: 0,
+        };
+        let (page, stopped) = scan_page(&raster, wanted, &Sheets::default(), false).unwrap();
+        assert!(page.parity_shortcut, "the passes of more effort were made");
+        assert!(!stopped, "a page that lacks nothing did not stop short");
+        assert_eq!(page.statistics.bad_blocks, 0);
+    }
+
+    #[test]
+    fn the_unreadable_count_is_the_same_with_and_without_the_quality() {
+        // A clean page turned by 6 degrees: the drawing of the quality once took cells over the
+        // title, whose letters gave the traced grid lines four corners, for unreadable blocks.
+        // The page of `tests/fixtures/damaged/legacy-1.png` before it was damaged.
+        let data: Vec<u8> = (0..90_000usize).map(|i| (i * 131 + i / 3) as u8).collect();
+        let options = EncodeOptions {
+            setup: PageSetup {
+                printer_dpi: 300,
+                dot_dpi: 200,
+                ..PageSetup::default()
+            },
+            compression: Compression::None,
+            ..EncodeOptions::legacy()
+        };
+        let raster = encode(&data, &options).unwrap().remove(0).raster;
+        let clean = raster.rotated(6.0, WHITE).unwrap();
+        let unreadable = |page: &Raster, quality| {
+            let options = DecodeOptions {
+                quality,
+                ..DecodeOptions::default()
+            };
+            let mut counts = None;
+            let _ = decode(std::slice::from_ref(page), &options, |outcome| {
+                let statistics = outcome.result.unwrap();
+                let shown = outcome.quality.map(|q| q.unreadable_blocks());
+                counts = Some((statistics.bad_blocks, shown));
+            });
+            counts.unwrap()
+        };
+        assert_eq!(unreadable(&clean, false), (0, None));
+        assert_eq!(unreadable(&clean, true), (0, Some(0)));
+    }
+
+    #[test]
+    fn a_turned_page_shows_exactly_its_damage() {
+        let (raster, layout, rows) = full_page_with(EncodeOptions::legacy());
+        let page = wiped_column(raster, &layout, rows, 5, false)
+            .rotated(8.0, WHITE)
+            .unwrap();
+        let unreadable = |quality| {
+            let options = DecodeOptions {
+                quality,
+                ..DecodeOptions::default()
+            };
+            let mut counts = None;
+            let _ = decode(std::slice::from_ref(&page), &options, |outcome| {
+                let statistics = outcome.result.unwrap();
+                let shown = outcome.quality.map(|q| q.unreadable_blocks());
+                counts = Some((statistics.bad_blocks, shown));
+            });
+            counts.unwrap()
+        };
+        assert_eq!(unreadable(false), (rows, None));
+        assert_eq!(unreadable(true), (rows, Some(rows)));
+    }
+
+    #[test]
+    fn the_quality_gives_every_cell_every_attempt_even_where_parity_covers_it() {
+        let (raster, layout, rows) = full_page_with(EncodeOptions::modern());
+        let page = wiped_column(raster, &layout, rows, 5, false);
+        let wanted = |quality| Wanted {
+            quality,
+            diagnose: false,
+            threads: 0,
+        };
+        let sheets = Sheets::default();
+        // Without the quality the parity blocks on the page cover the column, and reading stops.
+        let (plain, stopped) = scan_page(&page, wanted(false), &sheets, false).unwrap();
+        assert!(stopped && plain.parity_shortcut);
+        let (checked, stopped) = scan_page(&page, wanted(true), &sheets, false).unwrap();
+        assert!(!stopped && !checked.parity_shortcut);
+    }
+
+    #[test]
+    fn a_page_read_again_counts_the_corrections_of_the_blocks_it_adds_only() {
+        // A page without recovery blocks is read again, turned, when blocks are missing; those
+        // readings once set the corrections of the page although they added no block.
+        let (raster, layout, rows) = full_page_with(EncodeOptions::modern());
+        let page = wiped_column(raster, &layout, rows, 5, false);
+        let (statistics, _) = read_alone(page);
+        assert_eq!(statistics.bad_blocks, rows);
+        assert_eq!(statistics.restored_bytes, 0);
     }
 
     #[test]
@@ -1117,7 +1860,11 @@ mod tests {
             },
             ..EncodeOptions::default()
         };
-        let layout = PageLayout::compute(&options.setup, options.redundancy).unwrap();
+        let layout = PageLayout::compute(
+            &options.setup,
+            crate::plan::Strings::new(options.redundancy),
+        )
+        .unwrap();
         let bands = layout.text.map_or(0, |t| t.top_band() + t.bottom_band());
         for (at, page) in encode(&data, &options).unwrap().into_iter().enumerate() {
             let rows = (1..=layout.ny)

@@ -46,7 +46,13 @@ $cases = @(
   @{ Name = 'text-fast';    File = $text;   Compression = 1; Password = '' },
   @{ Name = 'text-crypt';   File = $text;   Compression = 2; Password = 'hunter2' },
   @{ Name = 'text-umlaut';  File = $text;   Compression = 2; Password = "p$([char]0xE4)ssw$([char]0xF6)rt" },
-  @{ Name = 'binary-crypt'; File = $binary; Compression = 0; Password = 'passw0rt' }
+  @{ Name = 'binary-crypt'; File = $binary; Compression = 0; Password = 'passw0rt' },
+  # Parity blocks, filled pages and pages without PaperBack's recovery blocks: the original must
+  # read them as plain pages.
+  @{ Name = 'text-legacy';   File = $text;   Compression = 2; Password = 'hunter2'; Extra = @('--legacy') },
+  @{ Name = 'binary-fill';   File = $binary; Compression = 0; Password = ''; Extra = @('--fill-pages') },
+  @{ Name = 'binary-parity'; File = $binary; Compression = 0; Password = ''; Extra = @('--redundancy', '0', '--parity', '40') },
+  @{ Name = 'text-modern';   File = $text;   Compression = 2; Password = 'hunter2'; Extra = @('--modern') }
 )
 $results = @()
 foreach ($c in $cases) {
@@ -67,6 +73,7 @@ foreach ($c in $cases) {
   Get-ChildItem $out -Filter "w-$tag*" -ErrorAction SilentlyContinue | ForEach-Object { $_.Delete() }
   $encArgs = @('encode', $c.File, '-o', "$out\w-$tag-%02d.bmp", '--printer-dpi', '300', '--dot-dpi', '200',
                '--compression', @('none', 'fast', 'max')[$c.Compression])
+  if ($c.Extra) { $encArgs += $c.Extra }
   $pwArgsOwn = @()
   if ($c.Password) { $env:PB_TEST_PW = $c.Password; $encArgs += @('--password-env', 'PB_TEST_PW'); $pwArgsOwn = @('--password-env', 'PB_TEST_PW') }
   & $pb @encArgs 2>&1 | Out-Null
@@ -75,7 +82,7 @@ foreach ($c in $cases) {
   # The pages written here carry a SHA-256 and a sheet identifier that the originals must not notice;
   # this program must find them again.
   $checked = & $pb decode @($ours) -v -o "$out\w-$tag.own" @($pwArgsOwn) 2>&1 | Out-String
-  $results += [pscustomobject]@{ Original = $Label; Case = $tag; Direction = 'paperback.rs -> paperback.rs (hash)'; Pass = ($checked -match 'matches the SHA-256' -and (Same $c.File "$out\w-$tag.own")); Note = 'extension records read back' }
+  $results += [pscustomobject]@{ Original = $Label; Case = $tag; Direction = 'paperback.rs -> paperback.rs (hash)'; Pass = ((Same $c.File "$out\w-$tag.own") -and (($checked -match 'matches the SHA-256') -ne ($c.Extra -contains '--legacy'))); Note = 'extension records read back (none with --legacy)' }
   $restored = "$out\w-$tag.restored"
   if (Test-Path $restored) { [IO.File]::Delete($restored) }
   $code = Run-Auto @('-Action', 'open', '-InputList', ($ours -join '|'), '-OutputPath', $restored, '-Password', $pass, '-TimeoutSec', 150)

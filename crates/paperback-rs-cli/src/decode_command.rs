@@ -23,7 +23,7 @@ pub(crate) fn run(args: &DecodeArgs) -> Result<()> {
         password: password::read(&args.password)?,
         quality: reports.wanted(),
         diagnose: args.verbose || args.json,
-        require_hash: args.require_hash,
+        require_hash: args.require_hash || args.modern,
         threads: args.threads,
     };
     if args.verbose {
@@ -140,8 +140,13 @@ fn report_page(outcome: &PageOutcome) {
     let number = outcome.index + 1;
     match &outcome.result {
         Ok(stats) => {
+            let effort = if stats.effort_blocks > 0 {
+                format!(" ({} only with more effort)", stats.effort_blocks)
+            } else {
+                String::new()
+            };
             eprintln!(
-                "page {number}: {} blocks read, {} unreadable, {} bytes corrected",
+                "page {number}: {} blocks read{effort}, {} unreadable, {} bytes corrected",
                 stats.good_blocks + stats.superblocks,
                 stats.bad_blocks,
                 stats.restored_bytes
@@ -191,6 +196,8 @@ fn summary(restored: &RestoredFile) -> String {
         "bad_blocks": report.bad_blocks,
         "corrected_bytes": report.restored_bytes,
         "recovered_blocks": report.recovered_blocks,
+        "parity_blocks": report.parity_blocks,
+        "parity_recovered_blocks": report.parity_recovered_blocks,
         "misplaced_blocks": report.misplaced_blocks,
         "sheets": report.sheets.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "integrity": integrity_name(report.integrity),

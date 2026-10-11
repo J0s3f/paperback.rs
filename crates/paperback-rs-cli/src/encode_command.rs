@@ -23,17 +23,42 @@ pub(crate) fn run(args: &EncodeArgs) -> Result<()> {
     let (data, source_name, modified) = read_input(args.input.as_deref())?;
     let options = EncodeOptions {
         setup: page_setup(args)?,
-        redundancy: Redundancy::new(args.redundancy)
-            .ok_or_else(|| CliError::other("--redundancy must be between 2 and 10"))?,
         compression: compression(args.compression),
         password: password::read(&args.password)?,
         name: args.name.clone().unwrap_or(source_name),
         modified,
-        extensions: !args.no_extensions,
-        ..EncodeOptions::default()
+        ..redundancy_options(args)?
     };
     let pages = encode(&data, &options)?;
     destination.write(&pages)
+}
+
+/// The options for PaperBack's redundancy, parity, filling and the records.
+fn redundancy_options(args: &EncodeArgs) -> Result<EncodeOptions> {
+    let base = if args.modern {
+        EncodeOptions::modern()
+    } else if args.legacy {
+        EncodeOptions::legacy()
+    } else {
+        EncodeOptions::balanced()
+    };
+    let redundancy = match args.redundancy {
+        None => base.redundancy,
+        Some(0) => None,
+        Some(n) => Some(
+            Redundancy::new(n)
+                .ok_or_else(|| CliError::other("--redundancy must be 0 or between 2 and 10"))?,
+        ),
+    };
+    // As many parity blocks as fit the code; the encoder says how many if asked for more.
+    let parity_percent = args.parity.unwrap_or(base.parity_percent);
+    Ok(EncodeOptions {
+        redundancy,
+        parity_percent,
+        fill_pages: args.fill_pages.unwrap_or(base.fill_pages),
+        extensions: base.extensions && !args.no_extensions,
+        ..base
+    })
 }
 
 fn read_input(path: Option<&Path>) -> Result<(Vec<u8>, String, FileTime)> {
@@ -100,5 +125,41 @@ fn compression(level: CompressionLevel) -> Compression {
         CompressionLevel::None => Compression::None,
         CompressionLevel::Fast => Compression::Fast,
         CompressionLevel::Max => Compression::Maximal,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+    use crate::cli::{Cli, Command};
+
+    /// Whether `encode` with these options fills the pages.
+    fn fills(options: &[&str]) -> bool {
+        let args = ["paperback-rs", "encode", "in.bin", "-o", "out.png"]
+            .into_iter()
+            .chain(options.iter().copied());
+        let Command::Encode(args) = Cli::try_parse_from(args).unwrap().command else {
+            unreachable!("encode was asked for");
+        };
+        redundancy_options(&args).unwrap().fill_pages
+    }
+
+    #[test]
+    fn modern_fills_the_pages_unless_told_otherwise() {
+        assert!(fills(&["--modern"]));
+        assert!(!fills(&["--modern", "--fill-pages", "false"]));
+        assert!(!fills(&["--modern", "--fill-pages=false"]));
+        assert!(!fills(&["--fill-pages", "false", "--modern"]));
+    }
+
+    #[test]
+    fn fill_pages_is_off_by_default_and_on_without_a_value() {
+        assert!(!fills(&[]));
+        assert!(!fills(&["--balanced"]));
+        assert!(fills(&["--fill-pages"]));
+        assert!(fills(&["--fill-pages", "true"]));
+        assert!(fills(&["--balanced", "--fill-pages"]));
     }
 }

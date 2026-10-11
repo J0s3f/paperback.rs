@@ -25,8 +25,6 @@ const PAPER: [u8; 3] = [255, 255, 255];
 const QUAD_PAINT_STEP: f64 = 0.5;
 /// Corners that must have been found in the picture for an unreadable block to be drawn.
 const MIN_CORNERS_TO_PAINT: usize = 3;
-/// All four corners of a block.
-const FULL_QUAD: usize = 4;
 const OVERLAY_STRENGTH: f64 = 0.45;
 
 /// An 8-bit colour picture, rows stored top to bottom.
@@ -59,6 +57,9 @@ impl ColorImage {
 pub(crate) enum BlockQuality {
     /// There is no block here (outside the page or no grid found).
     Absent,
+    /// Not read: a block was read at this place in an earlier reading of the picture, or in
+    /// another picture of the sheet. There is a block, but this reading says nothing about it.
+    Known,
     /// The block was found but could not be repaired.
     Unreadable,
     /// The block was read after correcting this many bytes.
@@ -69,7 +70,7 @@ impl BlockQuality {
     /// Colour of the block, or `None` where there is nothing to show.
     fn color(self) -> Option<[u8; 3]> {
         match self {
-            Self::Absent => None,
+            Self::Absent | Self::Known => None,
             Self::Unreadable => Some(hsv(RED_HUE)),
             Self::Readable(corrected) => {
                 let share = corrected.min(MAX_CORRECTIONS) as f64 / MAX_CORRECTIONS as f64;
@@ -80,9 +81,15 @@ impl BlockQuality {
 }
 
 /// Block by block quality of one page, with the picture it was read from.
+///
+/// When a picture is read more than once (straightened, or with the angle nudged), the blocks
+/// of the later readings are added to the cells of this one where they lie in the picture, so
+/// that a cell is unreadable only if no reading could read it. Cells that read only then, or
+/// only in the passes of more effort after the first one, are drawn hatched.
 #[derive(Clone, Debug)]
 pub struct PageQuality {
-    page: Raster,
+    /// The picture as it was read; only kept when the quality is to be drawn.
+    page: Option<Raster>,
     grid: Grid,
     columns: usize,
     rows: usize,
@@ -92,11 +99,28 @@ pub struct PageQuality {
     /// The four corners of every block (row by row from the top), when they were followed
     /// across the page; they draw bent paper better than the straight grid and the shifts.
     quads: Option<Vec<Quad>>,
+    /// The cells between blocks that were found where no block was found (see [`gaps`]).
+    gaps: Vec<bool>,
+    /// The cells whose block read only with more effort than the first pass gives: in a later
+    /// pass over the blocks still missing, or in another reading of the picture.
+    effort: Vec<bool>,
+    /// The middle of every cell in the picture the caller gave, where the blocks of other
+    /// readings of it find their cell; empty if not known.
+    centres: Vec<(f64, f64)>,
+    /// How far from the middle of a cell a block may lie and still be the block of that cell.
+    reach: f64,
 }
+
+/// Pixels between the starts of two stripes of the hatching of blocks read with effort.
+const HATCH_PERIOD: usize = 8;
+/// Pixels of each stripe.
+const HATCH_WIDTH: usize = 3;
+/// Share of the colour kept on the stripes.
+const HATCH_SHADE: f64 = 0.6;
 
 impl PageQuality {
     pub(crate) fn new(
-        page: Raster,
+        page: Option<Raster>,
         grid: Grid,
         columns: usize,
         rows: usize,
@@ -107,10 +131,11 @@ impl PageQuality {
         debug_assert_eq!(cells.len(), columns * rows);
         debug_assert_eq!(shifts.len(), cells.len());
         debug_assert!(quads.as_ref().is_none_or(|q| q.len() == cells.len()));
-        mark_gaps_as_unreadable(&mut cells, columns);
-        if let Some(quads) = &quads {
-            mark_followed_blocks_as_unreadable(&mut cells, quads);
-        }
+        // Which cells hold an unreadable block follows from the reading alone, never from the
+        // corners of the drawing: these are only traced when the quality is drawn, and letters of
+        // the title give corners too.
+        let gaps = mark_gaps_as_unreadable(&mut cells, columns);
+        let count = cells.len();
         Self {
             page,
             grid,
@@ -119,7 +144,48 @@ impl PageQuality {
             cells,
             shifts,
             quads,
+            gaps,
+            effort: vec![false; count],
+            centres: Vec::new(),
+            reach: 0.0,
         }
+    }
+
+    /// The same, with the middle of every cell in the picture the caller gave, how far a block
+    /// may lie from it, and which cells read only with more effort than the first pass gives.
+    pub(crate) fn with_placed_cells(
+        mut self,
+        centres: Vec<(f64, f64)>,
+        reach: f64,
+        effort: Vec<bool>,
+    ) -> Self {
+        debug_assert_eq!(centres.len(), self.cells.len());
+        debug_assert_eq!(effort.len(), self.cells.len());
+        self.centres = centres;
+        self.reach = reach;
+        self.effort = effort;
+        self
+    }
+
+    /// Adds a block that another reading of the picture read at `place` (in the picture the
+    /// caller gave) with `corrected` bytes corrected: the cell it lies in counts as read, with
+    /// effort, unless this reading read it already. Whether a cell was changed.
+    pub(crate) fn add_read(&mut self, place: (f64, f64), corrected: usize) -> bool {
+        let nearest = self
+            .centres
+            .iter()
+            .enumerate()
+            .map(|(at, centre)| (at, (centre.0 - place.0).hypot(centre.1 - place.1)))
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        let Some((at, distance)) = nearest else {
+            return false;
+        };
+        if distance > self.reach || matches!(self.cells[at], BlockQuality::Readable(_)) {
+            return false;
+        }
+        self.cells[at] = BlockQuality::Readable(corrected);
+        self.effort[at] = true;
+        true
     }
 
     /// Blocks that were read.
@@ -127,6 +193,15 @@ impl PageQuality {
         self.cells
             .iter()
             .filter(|cell| matches!(cell, BlockQuality::Readable(_)))
+            .count()
+    }
+
+    /// Blocks that were read only with more effort than the first pass gives.
+    pub fn blocks_read_with_effort(&self) -> usize {
+        self.cells
+            .iter()
+            .zip(&self.effort)
+            .filter(|(cell, effort)| matches!(cell, BlockQuality::Readable(_)) && **effort)
             .count()
     }
 
@@ -161,25 +236,34 @@ impl PageQuality {
     }
 
     /// Paints every pixel from the scan's gray level: `inside` for pixels in a
-    /// block (given the block colour), `outside` for the rest.
+    /// block (given the block colour), `outside` for the rest. Without the picture (the
+    /// quality was not asked for) there is nothing to paint.
     fn paint(
         &self,
         inside: impl Fn(u8, [u8; 3]) -> [u8; 3],
         outside: impl Fn(u8) -> [u8; 3],
     ) -> ColorImage {
-        let (width, height) = (self.page.width(), self.page.height());
+        let Some(page) = &self.page else {
+            return ColorImage {
+                width: 0,
+                height: 0,
+                rgb: Vec::new(),
+            };
+        };
+        let (width, height) = (page.width(), page.height());
         let mut rgb = Vec::with_capacity(width * height * 3);
         if let Some(quads) = &self.quads {
-            for &gray in self.page.pixels() {
+            for &gray in page.pixels() {
                 rgb.extend_from_slice(&outside(gray));
             }
-            self.paint_quads(quads, &inside, &mut rgb);
+            self.paint_quads(page, quads, &inside, &mut rgb);
             return ColorImage { width, height, rgb };
         }
         for y in 0..height {
-            for (x, &gray) in self.page.row(y).iter().enumerate() {
-                let pixel = match self.cell_at(x, y).and_then(BlockQuality::color) {
-                    Some(color) => inside(gray, color),
+            for (x, &gray) in page.row(y).iter().enumerate() {
+                let at = self.cell_at(page, x, y);
+                let pixel = match at.and_then(|at| self.cells[at].color()) {
+                    Some(color) => inside(gray, self.hatched(at, color, x, y)),
                     None => outside(gray),
                 };
                 rgb.extend_from_slice(&pixel);
@@ -188,21 +272,36 @@ impl PageQuality {
         ColorImage { width, height, rgb }
     }
 
+    /// The colour of cell `at` at pixel (`x`, `y`): darker on diagonal stripes where the block
+    /// read only with more effort.
+    fn hatched(&self, at: Option<usize>, color: [u8; 3], x: usize, y: usize) -> [u8; 3] {
+        let effort = at.is_some_and(|at| self.effort[at]);
+        if effort && (x + y) % HATCH_PERIOD < HATCH_WIDTH {
+            color.map(|channel| (f64::from(channel) * HATCH_SHADE).round() as u8)
+        } else {
+            color
+        }
+    }
+
     /// Colours every block by walking over its quadrilateral in steps of half a pixel, which
     /// leaves no gaps; a pixel on the edge of two blocks takes the colour of the later one.
     fn paint_quads(
         &self,
+        page: &Raster,
         quads: &[Quad],
         inside: &impl Fn(u8, [u8; 3]) -> [u8; 3],
         rgb: &mut [u8],
     ) {
-        let (width, height) = (self.page.width(), self.page.height());
-        for (quad, cell) in quads.iter().zip(&self.cells) {
+        let (width, height) = (page.width(), page.height());
+        for (at, ((quad, cell), &gap)) in quads.iter().zip(&self.cells).zip(&self.gaps).enumerate()
+        {
             let Some(color) = cell.color() else {
                 continue;
             };
-            // A block whose lines were not found is outside the page, not a damaged block.
+            // A block whose lines were not found is outside the page, not a damaged block,
+            // unless it lies between blocks that were found: there its corners are estimated.
             if quad.corners_found < MIN_CORNERS_TO_PAINT
+                && !gap
                 && !matches!(cell, BlockQuality::Readable(_))
             {
                 continue;
@@ -226,18 +325,18 @@ impl PageQuality {
                         continue;
                     }
                     let (px, py) = (px as usize, py as usize);
-                    let pixel = inside(self.page.row(py)[px], color);
+                    let pixel = inside(page.row(py)[px], self.hatched(Some(at), color, px, py));
                     rgb[(py * width + px) * 3..][..3].copy_from_slice(&pixel);
                 }
             }
         }
     }
 
-    /// The block covering a pixel, following the tilt of the grid and the
-    /// measured shift of each block (paper that is bent moves its blocks).
-    fn cell_at(&self, x: usize, y: usize) -> Option<BlockQuality> {
+    /// The cell covering a pixel of `page`, following the tilt of the grid and the measured
+    /// shift of each block (paper that is bent moves its blocks).
+    fn cell_at(&self, page: &Raster, x: usize, y: usize) -> Option<usize> {
         // The decoder works on a bitmap whose first row is the bottom of the page.
-        let memory_y = (self.page.height() - 1 - y) as f64;
+        let memory_y = (page.height() - 1 - y) as f64;
         let memory_x = x as f64;
         let (column, row) = self.cell_index(memory_x, memory_y, (0.0, 0.0))?;
         let covers = |column: usize, row: usize| {
@@ -249,7 +348,7 @@ impl PageQuality {
         } else {
             self.neighbours(column, row).find(|&(c, r)| covers(c, r))?
         };
-        Some(self.cells[row * self.columns + column])
+        Some(row * self.columns + column)
     }
 
     /// Column and row (from the top) of the cell a point falls in when the grid
@@ -277,10 +376,10 @@ impl PageQuality {
     }
 }
 
-/// A block that is missing between blocks that were found is a block too damaged to
-/// even show its grid lines, so it is shown as unreadable. Only what lies inside the
-/// bounding box of the found blocks is treated so; the rest is outside the page.
-fn mark_gaps_as_unreadable(cells: &mut [BlockQuality], columns: usize) {
+/// The cells where no block was found that lie between blocks that were found: blocks too
+/// damaged to even show their grid lines. Only what lies inside the bounding box of the found
+/// blocks counts; the rest is outside the page.
+pub(crate) fn gaps(cells: &[BlockQuality], columns: usize) -> Vec<usize> {
     let found = |(_, cell): &(usize, &BlockQuality)| **cell != BlockQuality::Absent;
     let positions: Vec<(usize, usize)> = cells
         .iter()
@@ -294,25 +393,26 @@ fn mark_gaps_as_unreadable(cells: &mut [BlockQuality], columns: usize) {
     };
     let ((Some(left), Some(right)), (Some(top), Some(bottom))) = (bounds(|p| p.0), bounds(|p| p.1))
     else {
-        return;
+        return Vec::new();
     };
-    for (at, cell) in cells.iter_mut().enumerate() {
-        let (column, row) = (at % columns, at / columns);
-        let inside = (left..=right).contains(&column) && (top..=bottom).contains(&row);
-        if inside && *cell == BlockQuality::Absent {
-            *cell = BlockQuality::Unreadable;
-        }
-    }
+    (0..cells.len())
+        .filter(|&at| {
+            let (column, row) = (at % columns, at / columns);
+            (left..=right).contains(&column)
+                && (top..=bottom).contains(&row)
+                && cells[at] == BlockQuality::Absent
+        })
+        .collect()
 }
 
-/// A block that was not read but whose four corners were found along the grid lines is
-/// there, so it is shown as unreadable, also beyond the blocks that were read.
-fn mark_followed_blocks_as_unreadable(cells: &mut [BlockQuality], quads: &[Quad]) {
-    for (cell, quad) in cells.iter_mut().zip(quads) {
-        if *cell == BlockQuality::Absent && quad.corners_found == FULL_QUAD {
-            *cell = BlockQuality::Unreadable;
-        }
+/// Shows the [`gaps`] as unreadable; returns whether each cell is one.
+fn mark_gaps_as_unreadable(cells: &mut [BlockQuality], columns: usize) -> Vec<bool> {
+    let mut is_gap = vec![false; cells.len()];
+    for at in gaps(cells, columns) {
+        cells[at] = BlockQuality::Unreadable;
+        is_gap[at] = true;
     }
+    is_gap
 }
 
 /// Colour for a hue in degrees at the fixed saturation and value.
@@ -346,7 +446,7 @@ mod tests {
 
     fn quality(cells: Vec<BlockQuality>) -> PageQuality {
         PageQuality::new(
-            Raster::filled(20, 10, 100),
+            Some(Raster::filled(20, 10, 100)),
             grid(),
             2,
             1,
@@ -405,7 +505,7 @@ mod tests {
     #[test]
     fn gaps_between_found_blocks_count_as_unreadable_but_the_margin_does_not() {
         let q = PageQuality::new(
-            Raster::filled(40, 10, 100),
+            Some(Raster::filled(40, 10, 100)),
             grid(),
             4,
             1,
@@ -427,7 +527,7 @@ mod tests {
         // One block as a parallelogram leaning to the right; the picture is 40 x 20 pixels.
         let quad = Quad::new((4.0, 2.0), (14.0, 2.0), (10.0, 16.0), (20.0, 16.0), 4);
         let q = PageQuality::new(
-            Raster::filled(40, 20, 100),
+            Some(Raster::filled(40, 20, 100)),
             grid(),
             1,
             1,
@@ -453,6 +553,134 @@ mod tests {
         assert_eq!(pixel(&map, 30, 10), PAPER);
         // Left of the leaning edge at half height there is paper, not colour.
         assert_eq!(pixel(&map, 5, 10), PAPER);
+    }
+
+    #[test]
+    fn a_gap_whose_corners_were_not_found_is_painted_but_the_margin_is_not() {
+        // Three blocks in a row, 10 pixels each; only the outer ones showed their corners.
+        let quad = |left: f64, corners| {
+            Quad::new(
+                (left, 0.0),
+                (left + 10.0, 0.0),
+                (left, 10.0),
+                (left + 10.0, 10.0),
+                corners,
+            )
+        };
+        let q = PageQuality::new(
+            Some(Raster::filled(40, 10, 100)),
+            grid(),
+            4,
+            1,
+            vec![
+                BlockQuality::Readable(0),
+                BlockQuality::Absent,
+                BlockQuality::Readable(0),
+                BlockQuality::Absent,
+            ],
+            vec![(0.0, 0.0); 4],
+            Some(vec![
+                quad(0.0, 4),
+                quad(10.0, 0),
+                quad(20.0, 4),
+                quad(30.0, 0),
+            ]),
+        );
+        let map = q.map();
+        let red = BlockQuality::Unreadable.color().unwrap();
+        assert_eq!(
+            pixel(&map, 15, 5),
+            red,
+            "the gap is a block too damaged to show its lines"
+        );
+        assert_eq!(
+            pixel(&map, 35, 5),
+            PAPER,
+            "beyond the last block lies the margin"
+        );
+        assert_eq!(q.unreadable_blocks(), 1);
+    }
+
+    /// Three cells of 10 pixels in a row, their middles 10 pixels apart, a block within 4
+    /// pixels of a middle counting as its block.
+    fn row_of_three(cells: Vec<BlockQuality>) -> PageQuality {
+        PageQuality::new(
+            Some(Raster::filled(30, 10, 100)),
+            grid(),
+            3,
+            1,
+            cells,
+            vec![(0.0, 0.0); 3],
+            None,
+        )
+        .with_placed_cells(
+            vec![(5.0, 5.0), (15.0, 5.0), (25.0, 5.0)],
+            4.0,
+            vec![false; 3],
+        )
+    }
+
+    #[test]
+    fn a_block_of_another_reading_makes_its_cell_read_with_effort() {
+        let mut q = row_of_three(vec![
+            BlockQuality::Readable(0),
+            BlockQuality::Unreadable,
+            BlockQuality::Unreadable,
+        ]);
+        assert!(q.add_read((16.0, 6.0), 3));
+        assert_eq!(q.cells[1], BlockQuality::Readable(3));
+        assert_eq!((q.unreadable_blocks(), q.blocks_read_with_effort()), (1, 1));
+        // A cell read already stays as it was; a block too far from every middle is no cell's.
+        assert!(!q.add_read((5.0, 5.0), 9));
+        assert_eq!(q.cells[0], BlockQuality::Readable(0));
+        assert!(!q.add_read((25.0, 12.0), 0));
+        assert_eq!(q.cells[2], BlockQuality::Unreadable);
+    }
+
+    #[test]
+    fn cells_read_with_effort_are_hatched() {
+        let mut q = row_of_three(vec![BlockQuality::Readable(0); 3]);
+        q.effort[1] = true;
+        let map = q.map();
+        let green = BlockQuality::Readable(0).color().unwrap();
+        // Stripes where (x + y) % 8 < 3, darker; the rest of the cell keeps its colour.
+        assert_ne!(pixel(&map, 16, 0), green);
+        assert!(pixel(&map, 16, 0)[1] < green[1]);
+        assert_eq!(pixel(&map, 14, 0), green);
+        assert_eq!(
+            pixel(&map, 6, 0),
+            green,
+            "a cell read at once is not hatched"
+        );
+    }
+
+    #[test]
+    fn letters_whose_corners_the_mesh_followed_are_no_unreadable_block() {
+        // A cell beyond the blocks read, with all four corners traced (on the title, say).
+        let corners = |left: f64| {
+            Quad::new(
+                (left, 0.0),
+                (left + 10.0, 0.0),
+                (left, 10.0),
+                (left + 10.0, 10.0),
+                4,
+            )
+        };
+        let q = PageQuality::new(
+            Some(Raster::filled(30, 10, 100)),
+            grid(),
+            3,
+            1,
+            vec![
+                BlockQuality::Readable(0),
+                BlockQuality::Readable(0),
+                BlockQuality::Absent,
+            ],
+            vec![(0.0, 0.0); 3],
+            Some(vec![corners(0.0), corners(10.0), corners(20.0)]),
+        );
+        assert_eq!(q.cells[2], BlockQuality::Absent);
+        assert_eq!(q.unreadable_blocks(), 0);
     }
 
     #[test]

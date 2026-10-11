@@ -14,7 +14,7 @@ use super::assemble::ScannedPage;
 use super::sheet::{BlockKey, check_against_plan};
 use crate::block::{DATA_LEN, Redundancy, SuperBlock};
 use crate::pbx::{self, Record, SheetRecord};
-use crate::plan::{RECORD_CELLS, RECORD_CELLS_PER_END, Slot, plan_page};
+use crate::plan::{RECORD_CELLS, RECORD_CELLS_PER_END, Slot, Strings, behind_strings, plan_page};
 
 /// Cells a page may have at most; the numbers on the page are not trusted further.
 const MAX_CELLS: usize = 1 << 20;
@@ -70,8 +70,11 @@ fn take_records(page: &mut ScannedPage) -> Vec<Record> {
 /// The block that each cell of the page holds, from the layout the sheet record announces;
 /// `None` if the record does not describe a page of this file.
 fn expected_keys(label: &SuperBlock, sheet: &SheetRecord) -> Option<Vec<Option<BlockKey>>> {
-    let redundancy = Redundancy::new(sheet.group_size)?;
-    let group = redundancy.group_size();
+    let recovery = match sheet.group_size {
+        0 => None,
+        size => Some(Redundancy::new(size)?),
+    };
+    let strings = Strings::new(recovery);
     let (columns, rows) = (usize::from(sheet.columns), usize::from(sheet.rows));
     let page_size = label.page_size as usize;
     let first_offset = usize::from(label.page)
@@ -80,18 +83,34 @@ fn expected_keys(label: &SuperBlock, sheet: &SheetRecord) -> Option<Vec<Option<B
     let on_page = (label.data_size as usize)
         .checked_sub(first_offset)?
         .min(page_size);
-    let groups = on_page.div_ceil(DATA_LEN).div_ceil(group);
+    let groups = on_page.div_ceil(DATA_LEN).div_ceil(strings.data);
     let cells = columns.checked_mul(rows)?;
-    let needed = (groups + 1) * (group + 1) + RECORD_CELLS;
-    if columns == 0 || groups == 0 || needed > cells || cells > MAX_CELLS {
+    let parity_count = sheet.parity_count as usize;
+    let parity_first = sheet.parity_first as usize;
+    // The parity blocks of the page are among those of the file, whose addresses all fit.
+    let most_parity = crate::parity::Code::new((label.data_size as usize).div_ceil(DATA_LEN))
+        .max_parity()
+        .min(sheet.parity_total as usize);
+    if columns == 0
+        || groups == 0
+        || cells > MAX_CELLS
+        || parity_count > cells
+        || parity_first.checked_add(parity_count)? > most_parity
+    {
+        return None;
+    }
+    let behind = behind_strings(parity_first, parity_count);
+    let needed = strings.cells(groups) + RECORD_CELLS + behind.len();
+    if needed > cells {
         return None;
     }
     let slots = plan_page(
         first_offset as u32,
         groups,
-        redundancy,
+        strings,
         (columns, rows),
         RECORD_CELLS_PER_END,
+        &behind,
     );
     Some(
         slots
@@ -99,6 +118,7 @@ fn expected_keys(label: &SuperBlock, sheet: &SheetRecord) -> Option<Vec<Option<B
             .map(|slot| match slot {
                 Slot::Data(offset) => Some((false, offset)),
                 Slot::Recovery(group_start) => Some((true, group_start)),
+                Slot::Parity(index) => Some((false, crate::parity::address(index))),
                 Slot::Label | Slot::Spare => None,
             })
             .collect(),
@@ -133,7 +153,59 @@ mod tests {
             columns,
             rows,
             group_size,
+            parity_first: 0,
+            parity_count: 0,
+            parity_total: 0,
         }
+    }
+
+    #[test]
+    fn the_plan_of_a_page_names_its_parity_blocks() {
+        // 2 groups of 6 data blocks without recovery blocks and 20 parity blocks from 40 on.
+        let page_size = 2 * 6 * DATA_LEN as u32;
+        let record = SheetRecord {
+            parity_first: 40,
+            parity_count: 20,
+            parity_total: 60,
+            ..sheet(2, 12, 6, 0)
+        };
+        let plan = expected_keys(&label(2 * page_size, page_size, 2), &record).unwrap();
+        let parity: Vec<u32> = plan
+            .iter()
+            .flatten()
+            .filter(|key| key.1 % DATA_LEN as u32 != 0)
+            .map(|key| key.1)
+            .collect();
+        assert_eq!(parity.len(), 20);
+        assert_eq!(parity[0], crate::parity::address(40));
+        assert_eq!(plan.iter().flatten().filter(|key| key.0).count(), 0);
+        assert_eq!(plan.iter().flatten().count(), 12 + 20);
+    }
+
+    #[test]
+    fn parity_blocks_beyond_those_of_the_file_give_no_plan() {
+        // A record that puts the parity blocks of the page beyond those of the file, or beyond
+        // any address, once gave addresses cut short to 32 bits, or overflowed on 32-bit systems.
+        let page_size = 2 * 6 * DATA_LEN as u32;
+        let label = label(2 * page_size, page_size, 2);
+        for (first, total) in [(40, 59), (u32::MAX - 10, u32::MAX), (1 << 30, u32::MAX)] {
+            let record = SheetRecord {
+                parity_first: first,
+                parity_count: 20,
+                parity_total: total,
+                ..sheet(2, 12, 6, 0)
+            };
+            assert!(expected_keys(&label, &record).is_none(), "{first}");
+        }
+    }
+
+    #[test]
+    fn parity_that_does_not_fit_the_page_gives_no_plan() {
+        let record = SheetRecord {
+            parity_count: 60,
+            ..sheet(1, 12, 6, 5)
+        };
+        assert!(expected_keys(&label(1800, 1800, 1), &record).is_none());
     }
 
     #[test]
@@ -157,7 +229,7 @@ mod tests {
     #[test]
     fn a_record_that_does_not_fit_the_page_gives_no_plan() {
         let page_one = label(1800, 1800, 1);
-        assert!(expected_keys(&page_one, &sheet(1, 12, 6, 0)).is_none());
+        assert!(expected_keys(&page_one, &sheet(1, 12, 6, 11)).is_none());
         assert!(expected_keys(&page_one, &sheet(1, 0, 6, 5)).is_none());
         assert!(expected_keys(&page_one, &sheet(1, 3, 3, 5)).is_none());
         assert!(expected_keys(&page_one, &sheet(1, u16::MAX, u16::MAX, 5)).is_none());

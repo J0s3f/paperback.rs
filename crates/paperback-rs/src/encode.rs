@@ -13,15 +13,18 @@ use crate::crc::crc16;
 use crate::error::{Error, Result};
 use crate::layout::{CELL_DOTS, PageLayout, PageSetup};
 use crate::pagetext::{self, TextStyle};
+use crate::parity::{self, Code};
 use crate::pbx::{self, HashRecord, Record, SheetId, SheetRecord};
-use crate::plan::{RECORD_CELLS, RECORD_CELLS_PER_END, Slot, plan_page};
+use crate::plan::{
+    Demand, PageShare, Pagination, RECORD_CELLS, RECORD_CELLS_PER_END, Slot, Strings,
+    behind_strings, plan_page,
+};
 use crate::raster::{Raster, WHITE};
+use rayon::prelude::*;
 
 /// Gray level of data dots; deliberately not black so the grid lines stand out.
 const DOT_LEVEL: u8 = 64;
 const LINE_LEVEL: u8 = 0;
-/// Pages carry at least this many block rows so the orientation stays detectable.
-const MIN_ROWS: usize = 3;
 const ALIGNMENT_ROW_PATTERN_ODD: u32 = 0xAAAA_AAAA;
 const ALIGNMENT_ROW_PATTERN_EVEN: u32 = 0x5555_5555;
 /// Windows "archive" attribute, the usual state of a plain file.
@@ -32,8 +35,17 @@ pub const DEFAULT_ATTRIBUTES: u8 = 0x20;
 pub struct EncodeOptions {
     /// Page geometry and print settings.
     pub setup: PageSetup,
-    /// One recovery block per this many data blocks.
-    pub redundancy: Redundancy,
+    /// PaperBack's redundancy: one recovery block per this many data blocks, which the
+    /// original programs use too. `None` leaves the recovery blocks out.
+    pub redundancy: Option<Redundancy>,
+    /// Parity blocks per 100 data blocks, as many as fit the code: at least 300, and more for
+    /// files of fewer than 16384 data blocks (`100 * (65536 - blocks) / blocks`); [`encode`]
+    /// says how many when asked for more. Data blocks up to their number can be rebuilt from
+    /// them, on whichever pages they are lost; the original programs ignore them. A file of more than 16384 data blocks is cut into
+    /// `ceil(blocks / 16384)` interleaved stripes (block `i` in stripe `i % stripes`), and each
+    /// stripe is rebuilt only from its own parity blocks: consecutive losses, such as a whole
+    /// page, spread evenly over them, but losses that fall on one stripe are limited by its share.
+    pub parity_percent: u32,
     /// Compression applied before printing.
     pub compression: Compression,
     /// Empty or absent means no encryption.
@@ -48,19 +60,74 @@ pub struct EncodeOptions {
     /// identifier and layout for each page, in cells that would repeat the label. The
     /// originals read such pages as before. Only used when there is room for it.
     pub extensions: bool,
+    /// Use the whole paper of every page, which is printed anyway: every free cell holds another
+    /// parity block. The number of pages stays the same.
+    pub fill_pages: bool,
+    /// Fail rather than leave out the records (the hash of the file) when a page has no room
+    /// for them.
+    pub require_extensions: bool,
+}
+
+/// Group size of PaperBack's redundancy that [`EncodeOptions::default`] uses.
+pub const DEFAULT_GROUP_SIZE: u8 = 10;
+/// Parity blocks per 100 data blocks that [`EncodeOptions::default`] uses.
+pub const DEFAULT_PARITY_PERCENT: u32 = 10;
+/// Parity blocks per 100 data blocks that [`EncodeOptions::modern`] uses: the default parity and
+/// as many blocks again as the default recovery blocks take.
+pub const MODERN_PARITY_PERCENT: u32 = DEFAULT_PARITY_PERCENT + 100 / DEFAULT_GROUP_SIZE as u32;
+
+impl EncodeOptions {
+    /// Pages as PaperBack 1.10 writes them: its recovery blocks with its default group size, and
+    /// nothing the originals do not know (no parity blocks, no records).
+    #[must_use]
+    pub fn legacy() -> Self {
+        Self {
+            redundancy: Some(Redundancy::default()),
+            parity_percent: 0,
+            fill_pages: false,
+            extensions: false,
+            require_extensions: false,
+            ..Self::default()
+        }
+    }
+
+    /// The default: some recovery blocks of PaperBack, which the originals use too, some parity
+    /// blocks, and the records with the hash of the file. The same as [`EncodeOptions::default`].
+    #[must_use]
+    pub fn balanced() -> Self {
+        Self::default()
+    }
+
+    /// Settings for pages meant for paperback.rs: no recovery blocks of PaperBack but as many
+    /// more parity blocks, filled pages, and the records with the hash of the file, required.
+    /// The original programs still read the pages but cannot rebuild lost blocks.
+    #[must_use]
+    pub fn modern() -> Self {
+        Self {
+            redundancy: None,
+            parity_percent: MODERN_PARITY_PERCENT,
+            fill_pages: true,
+            extensions: true,
+            require_extensions: true,
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for EncodeOptions {
     fn default() -> Self {
         Self {
             setup: PageSetup::default(),
-            redundancy: Redundancy::default(),
+            redundancy: Some(Redundancy::new(DEFAULT_GROUP_SIZE).unwrap_or_default()),
+            parity_percent: DEFAULT_PARITY_PERCENT,
             compression: Compression::Maximal,
             password: None,
             name: String::new(),
             modified: FileTime::default(),
             attributes: DEFAULT_ATTRIBUTES,
             extensions: true,
+            fill_pages: false,
+            require_extensions: false,
         }
     }
 }
@@ -111,33 +178,51 @@ pub fn encode_with_salt(
     if data.len() > MAX_FILE_SIZE as usize {
         return Err(Error::InputTooLarge(data.len()));
     }
-    let layout = PageLayout::compute(&options.setup, options.redundancy)?;
-    let records = options.extensions && layout.has_room_for(options.redundancy, RECORD_CELLS);
+    let strings = Strings::new(options.redundancy);
+    let layout = PageLayout::compute(&options.setup, strings)?;
+    let records = options.extensions && layout.has_room_for(strings, RECORD_CELLS);
     let payload = Payload::prepare(data, options, salt_and_iv, records)?;
+    if options.require_extensions && payload.seal.is_none() {
+        return Err(Error::InvalidSetting(
+            "the pages have no room for the hash of the file".into(),
+        ));
+    }
     let reserved = if payload.seal.is_some() {
         RECORD_CELLS
     } else {
         0
     };
-    let capacity = layout.page_capacity(options.redundancy, reserved);
-    let label = payload.label(options, capacity);
-    let page_count = payload.bytes.len().div_ceil(capacity);
-    if page_count > usize::from(u16::MAX) {
-        return Err(Error::InvalidSetting(format!(
-            "the data needs {page_count} pages; at most {} are possible",
-            u16::MAX
-        )));
-    }
+    let blocks = payload.bytes.len().div_ceil(DATA_LEN);
+    let code = Code::new(blocks);
+    let demand = Demand {
+        blocks,
+        strings,
+        size: (layout.nx, layout.ny),
+        reserved,
+        // In 64 bits: blocks times a percentage can overflow 32.
+        parity: usize::try_from((blocks as u64 * u64::from(options.parity_percent)).div_ceil(100))
+            .unwrap_or(usize::MAX),
+        max_parity: code.max_parity(),
+        fill: options.fill_pages,
+    };
+    let plan = paginate(&demand, usize::from(u16::MAX))?;
+    let page_count = plan.pages.len();
+    let page_size = plan.groups_per_page * strings.group_bytes();
+    let label = payload.label(options, page_size);
     let renderer = PageRenderer {
         layout,
         frame: options.setup.frame,
-        redundancy: options.redundancy,
-        page_count,
+        strings,
+        parity: code.encode(&payload.bytes, plan.parity),
+        plan,
+        page_size,
         seal: payload.seal,
         dot_pitch: layout.dx,
         printer_dpi: options.setup.printer_dpi,
     };
+    // The pages are drawn side by side.
     Ok((0..page_count)
+        .into_par_iter()
         .map(|index| Page {
             raster: renderer.render(&payload.bytes, index, &label),
             dpi: options.setup.printer_dpi as u32,
@@ -260,8 +345,13 @@ const RECORDS_PER_FILE: usize = 3;
 struct PageRenderer {
     layout: PageLayout,
     frame: bool,
-    redundancy: Redundancy,
-    page_count: usize,
+    strings: Strings,
+    /// What every page holds.
+    plan: Pagination,
+    /// The parity blocks of the file.
+    parity: Vec<[u8; DATA_LEN]>,
+    /// Bytes of the file on a page; the last page may hold fewer.
+    page_size: usize,
     seal: Option<Seal>,
     dot_pitch: usize,
     printer_dpi: usize,
@@ -269,23 +359,22 @@ struct PageRenderer {
 
 impl PageRenderer {
     fn render(&self, payload: &[u8], page_index: usize, label: &SuperBlock) -> Raster {
-        let capacity = self.layout.page_capacity(self.redundancy, self.reserved());
-        let offset = page_index * capacity;
-        let on_page = (payload.len() - offset).min(capacity);
-        let group = self.redundancy.group_size();
-        let groups = on_page.div_ceil(DATA_LEN).div_ceil(group);
-        let rows = self.rows_needed(groups);
+        let offset = page_index * self.page_size;
+        let share = self.plan.pages[page_index];
+        let rows = share.rows;
+        let behind = behind_strings(share.parity_first, share.parity_count);
 
         let mut label = label.clone();
         label.page = (page_index + 1) as u16;
         let slots = plan_page(
             offset as u32,
-            groups,
-            self.redundancy,
+            share.groups,
+            self.strings,
             (self.layout.nx, rows),
             self.reserved() / 2,
+            &behind,
         );
-        let blocks = self.fill(&slots, &payload[offset..], offset as u32, &label, rows);
+        let blocks = self.fill(&slots, payload, &label, share);
 
         let mut canvas = Canvas::new(&self.layout, rows);
         canvas.draw_grid_lines(self.frame);
@@ -323,7 +412,7 @@ impl PageRenderer {
             label.modified,
             label.original_size,
             page_index + 1,
-            self.page_count,
+            self.plan.pages.len(),
         );
         style.draw_header(&mut page, &header);
         let footer = pagetext::footer_line(self.printer_dpi, self.dot_pitch);
@@ -341,14 +430,13 @@ impl PageRenderer {
         &self,
         slots: &[Slot],
         payload: &[u8],
-        first_offset: u32,
         label: &SuperBlock,
-        rows: usize,
+        share: PageShare,
     ) -> Vec<RawBlock> {
-        let group = self.redundancy.group_size();
+        let group = self.strings.data;
         let data_at = |offset: u32| -> [u8; DATA_LEN] {
             let mut data = [0u8; DATA_LEN];
-            let consumed = (offset - first_offset) as usize;
+            let consumed = offset as usize;
             if consumed < payload.len() {
                 let available = (payload.len() - consumed).min(DATA_LEN);
                 data[..available].copy_from_slice(&payload[consumed..consumed + available]);
@@ -356,7 +444,7 @@ impl PageRenderer {
             data
         };
         let label_block = label.to_raw();
-        let records = self.records(label, rows);
+        let records = self.records(label, share);
         let last = slots.len() - 1;
         // One copy of the records at the start of the page, one at its end.
         let record_in = |cell: usize| {
@@ -381,9 +469,10 @@ impl PageRenderer {
                         let data = data_at(group_start + (string * DATA_LEN) as u32);
                         recovery.iter_mut().zip(&data).for_each(|(r, d)| *r ^= d);
                     }
-                    let address = slot.address(self.redundancy).unwrap_or(group_start);
+                    let address = slot.address(self.strings).unwrap_or(group_start);
                     RawBlock::new(address, &recovery)
                 }
+                Slot::Parity(index) => RawBlock::new(parity::address(index), &self.parity[index]),
                 Slot::Label => label_block.clone(),
                 Slot::Spare => record_in(cell).unwrap_or_else(|| label_block.clone()),
             })
@@ -392,7 +481,7 @@ impl PageRenderer {
 
     /// The records of a page: the sheet, the hash and the parity of the two. The page carries
     /// the set twice, at its start and at its end.
-    fn records(&self, label: &SuperBlock, rows: usize) -> Vec<RawBlock> {
+    fn records(&self, label: &SuperBlock, share: PageShare) -> Vec<RawBlock> {
         let Some(seal) = self.seal else {
             return Vec::new();
         };
@@ -400,10 +489,13 @@ impl PageRenderer {
         let sheet_record = SheetRecord {
             id: SheetId::derive(&seal.stream_hash, page, label.data_size),
             page,
-            page_count: self.page_count as u16,
+            page_count: self.plan.pages.len() as u16,
             columns: self.layout.nx as u16,
-            rows: rows as u16,
-            group_size: self.redundancy.group_size() as u8,
+            rows: share.rows as u16,
+            group_size: self.strings.recovery.map_or(0, |r| r.group_size() as u8),
+            parity_first: share.parity_first as u32,
+            parity_count: share.parity_count as u32,
+            parity_total: self.plan.parity as u32,
         };
         let hash_record = HashRecord {
             digest: seal.digest,
@@ -421,16 +513,6 @@ impl PageRenderer {
                 RawBlock::new(address, &record.to_payload())
             })
             .collect()
-    }
-
-    /// The last page shrinks to the rows it needs, but never below three.
-    fn rows_needed(&self, groups: usize) -> usize {
-        let spare = if self.seal.is_some() { RECORD_CELLS } else { 1 };
-        let blocks = (groups + 1) * (self.redundancy.group_size() + 1) + spare;
-        blocks
-            .div_ceil(self.layout.nx)
-            .max(MIN_ROWS)
-            .min(self.layout.ny)
     }
 }
 
@@ -559,6 +641,57 @@ impl<'a> Canvas<'a> {
 
 const _: () = assert!(CELL_DOTS == BLOCK_DOTS + 3);
 
+/// How the file is spread over at most `most_pages` pages, or why it cannot be: too many parity
+/// blocks for the code, or for the pages, which are named with the most there can be.
+fn paginate(demand: &Demand, most_pages: usize) -> Result<Pagination> {
+    let blocks = demand.blocks;
+    if demand.parity > demand.max_parity {
+        return Err(Error::InvalidSetting(format!(
+            "{} parity blocks do not fit the code; a file of {blocks} data blocks can have at most \
+             {} ({} per 100 data blocks)",
+            demand.parity,
+            demand.max_parity,
+            demand.max_parity * 100 / blocks
+        )));
+    }
+    let fits = |parity| {
+        Demand { parity, ..*demand }
+            .paginate()
+            .filter(|plan| plan.pages.len() <= most_pages)
+    };
+    if let Some(plan) = fits(demand.parity) {
+        return Ok(plan);
+    }
+    if demand.parity == 0 || fits(0).is_none() {
+        let pages = Demand {
+            parity: 0,
+            ..*demand
+        }
+        .paginate()
+        .map_or(0, |plan| plan.pages.len());
+        return Err(Error::InvalidSetting(format!(
+            "the data needs {pages} pages; at most {most_pages} are possible"
+        )));
+    }
+    // Every page carries data, so a small file has few pages to put parity blocks on, and a
+    // large one may run out of page numbers.
+    let (mut most, mut too_many) = (0, demand.parity);
+    while too_many - most > 1 {
+        let middle = most + (too_many - most) / 2;
+        if fits(middle).is_some() {
+            most = middle;
+        } else {
+            too_many = middle;
+        }
+    }
+    Err(Error::InvalidSetting(format!(
+        "{} parity blocks do not fit on the pages; with this page setup a file of {blocks} data \
+         blocks can have at most {most} ({} per 100 data blocks)",
+        demand.parity,
+        most * 100 / blocks
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -583,15 +716,71 @@ mod tests {
     }
 
     #[test]
+    fn parity_that_needs_more_pages_than_can_be_numbered_is_refused_with_the_most() {
+        // Once the parity asked for could take the pages past the last page number and the
+        // error said only how many pages the data needs. Here a page holds 17 groups, and three
+        // pages are all there can be.
+        let demand = Demand {
+            blocks: 40 * 5,
+            strings: Strings::new(Redundancy::new(5)),
+            size: (12, 10),
+            reserved: RECORD_CELLS,
+            parity: 0,
+            max_parity: 1_000_000,
+            fill: false,
+        };
+        assert_eq!(paginate(&demand, 3).unwrap().pages.len(), 3);
+        let fits = |parity| paginate(&Demand { parity, ..demand }, 3);
+        let most = (0..200)
+            .take_while(|&parity| fits(parity).is_ok())
+            .last()
+            .unwrap();
+        let message = fits(most + 1).unwrap_err().to_string();
+        assert!(message.contains(&format!("at most {most} ")), "{message}");
+        // Without parity the pages themselves are too many.
+        let message = paginate(&demand, 2).unwrap_err().to_string();
+        assert!(message.contains("needs 3 pages; at most 2"), "{message}");
+    }
+
+    #[test]
+    fn as_much_parity_as_fits_is_allowed_and_more_is_refused_with_the_most() {
+        // One data block on one page: the page holds a few hundred parity blocks, far fewer than
+        // the code would allow, and the message says how many.
+        let asking = |parity_percent| {
+            encode(
+                b"hello paper",
+                &EncodeOptions {
+                    setup: small_setup(),
+                    compression: Compression::None,
+                    parity_percent,
+                    ..EncodeOptions::default()
+                },
+            )
+        };
+        let Err(Error::InvalidSetting(message)) = asking(1_000_000) else {
+            panic!("a million percent fitted");
+        };
+        let most: u32 = message
+            .split('(')
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|number| number.parse().ok())
+            .unwrap_or_else(|| panic!("no maximum in {message:?}"));
+        assert!(most > 1000, "{message}");
+        assert_eq!(asking(most).unwrap().len(), 1);
+        assert!(asking(most + 100).is_err());
+    }
+
+    #[test]
     fn large_input_spans_several_pages() {
         let options = EncodeOptions {
             setup: small_setup(),
             compression: Compression::None,
             ..EncodeOptions::default()
         };
-        let capacity = PageLayout::compute(&options.setup, options.redundancy)
+        let capacity = PageLayout::compute(&options.setup, Strings::new(options.redundancy))
             .unwrap()
-            .page_capacity(options.redundancy, 0);
+            .page_capacity(Strings::new(options.redundancy), 0);
         let data = vec![0x5Au8; capacity * 2 + 1];
         assert_eq!(encode(&data, &options).unwrap().len(), 3);
     }

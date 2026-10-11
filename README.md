@@ -30,6 +30,9 @@ Credits and licences of the parts it builds on are in [NOTICE.md](NOTICE.md).
 - Write a file as PNG pages, 8-bit BMP pages (the only image format the original opens) or one PDF.
 - Read pages from PNG, JPEG, BMP and PDF files, in any order, whether they come from this tool, the original,
   a scanner or a camera. PDFs may hold Flate, LZW, JPEG, JPEG 2000, CCITT fax or JBIG2 images.
+- Rebuild the file from parity blocks spread over all pages, in the manner of PAR2: lost blocks up to their number
+  (per stripe of 16,384 data blocks in larger files, see [Profiles](#profiles-legacy-balanced-modern)), with enough of
+  them a whole lost page. The original program ignores them.
 - Rebuild the file when pages are tilted (up to 45 degrees; the original copes with about 5), rotated by a
   quarter turn, upside down, mirrored, crumpled and flattened again, photographed at an angle, or lightly damaged: every block has its own error correction, and a
   recovery block per group of data blocks rebuilds one lost block.
@@ -69,18 +72,73 @@ paperback-rs decode -v --json scan1.jpg scan2.jpg -o report.tar   # per page det
 ```
 
 Useful options for `encode`: `--printer-dpi 600` (resolution of your printer), `--dot-dpi 200` (dot density,
-at most half the printer resolution), `--dot-size 70` (percent of the dot pitch), `--redundancy 5` (one
-recovery block per five data blocks, 2 to 10), `--compression max|fast|none`, `--paper a4|letter`,
+at most half the printer resolution), `--dot-size 70` (percent of the dot pitch), `--redundancy 10` (one
+recovery block per ten data blocks, 2 to 10, 0 for none), `--parity 10` (parity blocks per 100 data
+blocks; lost blocks up to their number are rebuilt, per stripe in files of more than 16,384 data blocks), `--fill-pages` (use the whole paper of every page for more
+parity), `--legacy`, `--balanced`, `--modern` (see [Profiles](#profiles-legacy-balanced-modern)), `--compression max|fast|none`, `--paper a4|letter`,
 `--margins-mm L R T B`, `--frame`, `--no-text` (leave out the title above and the scanning hint below the
 dots). `paperback-rs --help` lists everything.
 
 Printing and scanning tips (the same as for the original): use a laser printer at its full resolution without
 scaling, scan in grayscale at about three times the dot density (900 dpi for the defaults on a 600 dpi
-printer) and check the result before you throw the digital copy away. One A4 page holds about 170
-kilobytes with the default settings (before compression).
+printer) and check the result before you throw the digital copy away. One A4 page holds about 155
+kilobytes with the default settings and about 170 with `--legacy` (before compression).
 
 Exit status: 0 success, 1 failure, 2 usage error, 3 unreadable or incomplete input (the message names the pages
 to scan again), 4 missing or wrong password.
+
+## Profiles: legacy, balanced, modern
+
+Pages can protect themselves in two ways. **Recovery blocks** are PaperBack's own: one per group of N data blocks
+(`--redundancy N`), each rebuilds one lost block of its group, and the original program uses them too. **Parity
+blocks** (`--parity PERCENT`, per 100 data blocks) are paperback.rs only: like PAR2 they rebuild lost blocks up to
+their number, wherever they were lost, so with enough of them a whole lost page. The original program reads pages with
+parity blocks but skips them. A page can carry both. Three profiles pick a mix for `encode`:
+
+| | `--legacy` | `--balanced` (default) | `--modern` |
+|---|---|---|---|
+| Recovery blocks (PaperBack) | 1 per 5 data blocks | 1 per 10 data blocks | none |
+| Parity blocks (paperback.rs) | none | 10 per 100 data blocks | 20 per 100, and the whole rest of every page |
+| SHA-256 / keyed check value, sheet records | no | yes | yes, required |
+| Pages used to the last row | no | no | yes (`--fill-pages`; `--fill-pages false` turns it off) |
+| Paper for the same file | as PaperBack | about the same as `--legacy` | about the same, last page full |
+| Read by PaperBack 1.10 | yes, with its recovery | yes, with its recovery | yes, but without any recovery |
+| Best for | pages that must look exactly like PaperBack's | most backups | backups that will be read with paperback.rs |
+
+- `--legacy` writes the pages PaperBack 1.10 itself would write: no parity blocks and no PBX1 records (no hash, no
+  sheet identifier). `--redundancy` can still change the group size.
+- `--balanced` is what you get without a profile. Its recovery blocks still help when the pages are read by the
+  original program; its parity blocks rebuild far more in paperback.rs: with ten parity blocks per hundred data
+  blocks, about a tenth of the data blocks may be lost (see stripes below for files of more than 16,384 blocks). `--redundancy`, `--parity`, `--fill-pages` and `--no-extensions` change
+  single parts.
+- `--modern` spends the paper of the recovery blocks on parity blocks instead (20 per 100), fills every page to the
+  last row with more of them, and requires the hash records: it fails rather than write pages without them. Use
+  `decode --modern` to also insist on the hash when reading (the same as `--require-hash`). `--parity` changes the
+  amount; `--fill-pages false` (or `--fill-pages=false`) keeps the last page short, as with the other profiles.
+  `--fill-pages` takes an optional `true` or `false`: give the input file before it, or write `--fill-pages=true`, so that the
+  file name is not taken for its value.
+
+To survive the loss of a whole page out of `p`, a file needs about `100 / (p - 1)` parity blocks per 100 data blocks,
+for example `--parity 50` for three pages. A single page cannot stand in for itself.
+
+**Stripes: the limit for larger files.** A file of up to 16,384 data blocks (about 1.4 MB as stored, after
+compression, some 9 pages with the default settings) is one stripe, and the rule above holds exactly: any lost data
+blocks, up to the number of parity blocks that were read, wherever they were. A larger file is cut into
+`s = ceil(blocks / 16384)` interleaved stripes (data block `i` belongs to stripe `i mod s`, and so does parity block
+`i`), and each stripe can only be rebuilt from its own parity blocks, about a `1/s` share of them.
+
+- Losses of consecutive blocks, such as a whole page or a part of one, spread evenly over the stripes, so for them the
+  total still counts, give or take one block per stripe.
+- Losses that happen to fall unevenly are limited by the stripe that lost most. For example, a file of 16,385 blocks
+  with `--redundancy 0 --parity 1` has 164 parity blocks, 82 in each stripe. Losing 83 blocks that are all
+  even-numbered (all in stripe 0) cannot be repaired, although all 164 parity blocks survive.
+
+`--parity` takes as many parity blocks as fit: the code allows at least three per data block (300), a file of fewer
+than 16,384 blocks more (`100 * (65536 - blocks) / blocks`), and a small file is limited by the paper, since every
+page carries data. Asked for more, `encode` says how many fit.
+
+Choose `--parity` with some margin for large files, and keep PaperBack's recovery blocks (`--redundancy`) where
+damage tends to hit single blocks. `docs/format.md` describes the code.
 
 ## Combining several photos or scans of the same page
 
@@ -105,7 +163,8 @@ paperback-rs decode photo1.jpg photo2.jpg photo3.jpg -o report.tar -v
   flat, a second scanner. Two pictures with the same shadow have the same gaps. A close-up of a corner is of use only if
   the grid of blocks is clearly visible in it.
 - **It saves time.** A picture is read only where the pictures before it left blocks missing, and when the file is
-  complete the remaining pictures are not read at all (`-v` says "not read: the file is complete already").
+  complete the remaining pictures are not read at all (`-v` says "not read: the file is complete already"). With
+  `--quality-map` or `--quality-overlay` every picture is read in full instead, so that each picture's quality is shown.
 - **Checking.** `-v` prints what each picture gave, and `--quality-overlay q-%d.png` writes one picture per input that
   shows which blocks it read, so you can see what the next photo has to cover.
 
@@ -119,10 +178,24 @@ paperback-rs decode scan-*.png --quality-overlay q-%02d.png -o report.tar     # 
 ```
 
 Green blocks read cleanly, blocks that needed more and more error correction shade through yellow to orange,
-and red blocks could not be read. `--quality-map` draws the colours on white paper; `--quality-overlay` lays
+and red blocks could not be read. The colours show how each picture was printed and scanned, not whether the file
+needed the block: every cell of every picture is read, also after the file is complete, where another picture of the
+sheet showed the block already, and where recovery or parity blocks would rebuild it. That takes longer than a plain
+decode. `--quality-map` draws the colours on white paper; `--quality-overlay` lays
 them over the scan so you can see where the damage is (a dirty spot, a fold, a bad scanner edge). The pictures
 show the page as it was read, which is the scan itself unless it had to be straightened or, because it has many more pixels than the dots need, reduced first. They are written
 even when the file cannot be restored, which is when they are most useful: they tell you what to rescan.
+
+- **Red means no attempt could read the block.** A picture that does not read completely is read again
+  straightened, and with its angle nudged; every block a later reading finds is put into its cell of the first one.
+  The count `-v` prints ("44 unreadable") is the number of red cells, with or without the pictures.
+- **Hatched means it took effort.** A block that read only in a later pass (sharper settings, the dots of the page
+  learnt, along bent grid lines) or only in the straightened picture is drawn with dark stripes over its colour, and
+  `-v` counts them: "1188 blocks read (10 only with more effort)". The colour still says how many bytes had to be
+  corrected; the stripes say that the block was hard to find or to sample, as on a creased, tilted or blurred scan.
+- **No colour** is where no block is: the margin, the title and the hint below the blocks. The grid of a picture
+  covers the whole picture, because the decoder cannot know where the blocks start, so a cell over the title is no
+  damaged block.
 
 ## Encryption: please read this
 
@@ -144,6 +217,8 @@ What it is, so you can judge:
   the pages carry a check value that the restored file matches. Pages of the original programs, and pages written with
   `--no-extensions`, carry none and cannot be read that way. Without `--require-hash` the 16-bit checksum is the
   only protection a page without a check value has, and it is also the only "wrong password" check for them.
+  Pages that carry different check values for the file are refused, whichever the file matches: either page could be
+  the one that was changed.
 - PaperBack 1.00 scheme (AES-256 in ECB mode keyed with the bare password): **decryption only**, so old
   backups stay readable. It is weak and paperback.rs will never write it.
 
@@ -210,10 +285,12 @@ processor lacks is never used.
 
 ## Extras that the original does not have
 
+Pages carry **parity blocks** (see [Profiles](#profiles-legacy-balanced-modern)); the original ignores them.
+
 Pages written by paperback.rs carry a SHA-256 of the file and an identifier and layout for each sheet. The originals
 ignore them (tested with 1.00 and 1.10); paperback.rs uses them to check the restored file against the hash, to tell
 sheets apart and to distrust a block read in the wrong place. `decode -v` reports them. To write plain pages without them
-use `--no-extensions`. Details: `docs/format.md`.
+use `--no-extensions` (or `--legacy`). Details: `docs/format.md`.
 
 ## Status
 

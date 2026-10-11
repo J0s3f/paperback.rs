@@ -12,8 +12,23 @@ Described from the user's point of view.
 - PDF pages are pure black and white (one bit per pixel): half the size, and the dots print as solid black instead of
   being halftoned. PNG and BMP keep the gray levels of the original program.
 - Large files continue on further pages; the last page shrinks to the rows it needs.
-- `--redundancy N` adds one recovery block per N data blocks (2 to 10), so a lost block per group
-  is rebuilt, and Reed-Solomon codes fix up to 16 bad bytes in every block.
+- `--redundancy N` adds one recovery block of PaperBack per N data blocks (2 to 10, default 10; 0 for none), so a lost
+  block per group is rebuilt, also by the original programs, and Reed-Solomon codes fix up to 16 bad bytes in every block.
+- `--parity PERCENT` adds parity blocks (default 10 per 100 data blocks): lost data blocks up to their number are
+  rebuilt, on whichever pages they were lost; with enough of them (100 / (pages - 1) percent) a whole page. Above
+  16384 data blocks the file is cut into interleaved stripes, each rebuilt only from its own share of the parity
+  blocks: a lost page spreads evenly over them, losses that fall on one stripe are limited by that share. As many
+  parity blocks as fit are allowed (at least 300 per 100, more for smaller files); `encode` names the most when asked
+  for more. PaperBack
+  ignores them. Both kinds can be combined (`docs/format.md`, "Parity blocks and filled pages").
+- `--fill-pages` uses the whole paper of every page for more parity blocks; the number of pages stays the same.
+  `--fill-pages false` (or `=false`) turns it off, also after `--modern`; give the input file before the option or
+  write `--fill-pages=true`, since the option takes an optional value.
+- `--legacy` writes pages as PaperBack 1.10 does: recovery blocks only (one per 5 data blocks), no parity blocks, no
+  records. `--balanced` is the default mix.
+- `--modern` writes pages for paperback.rs: no recovery blocks of PaperBack but as many more parity blocks (20 per
+  100), filled pages (unless `--fill-pages false`), and the hash records, required. `decode --modern` requires the
+  hash.
 - `--compression` selects bzip2 level (`fast`, `max`) or `none`. Data that does not shrink is
   stored unpacked.
 - A password (`--password-file`, `--password-env`) encrypts the data.
@@ -39,18 +54,31 @@ Described from the user's point of view.
   is pure black and white, stretched contrast or bright halos from sharpening. `--json` lists them as `hints`. Without
   `-v` or `--json` nothing is analysed and nothing is printed.
 - When the pages carry a SHA-256 the restored file is compared with it; a difference is an error (exit 3) and `-v`
-  reports a match. `--require-hash` turns a missing or non-matching hash into an error (exit 3). Pictures of one sheet are matched by their identifier as well as by block addresses. `--json` lists `integrity`, the sheet identifiers and `misplaced_blocks`.
+  reports a match. Pages that carry different hashes of the file are an error as well, whichever the file matches. `--require-hash` turns a missing or non-matching hash into an error (exit 3). Pictures of one sheet are matched by their identifier as well as by block addresses. `--json` lists `integrity`, the sheet identifiers and `misplaced_blocks`.
 - Pages written by paperback.rs tell their layout, so a block read in a cell where it does not belong is dropped
   instead of trusted (`-v` counts them).
 - `--threads N` sets how many threads read the blocks that do not read at once (default: all; 1 is one after the other); the same
   blocks are read either way.
 - Pages that cannot be read are reported with `-v` and skipped; the file is restored if the
   remaining pages carry everything.
+- Blocks rebuilt from parity blocks are checked against one parity block more, when one was read; a parity block that
+  does not fit (forged, or of another file) then rebuilds nothing instead of wrong bytes. Parity blocks beyond the number
+  the pages announce, and parity blocks read twice with different contents, are not used.
+- A page stops being read once its recovery or parity blocks cover what it lacks. If the file still lacks blocks in the
+  end, those pages are read again with every attempt; the counts of `-v` and `--json` are then those of the last
+  reading.
 - If blocks are missing, the error lists the pages to scan again.
 - Pages written by PaperBack 1.00 and 1.10 are accepted, including encrypted ones.
 - `--quality-map` and `--quality-overlay` write a PNG per page that colours every block from green (read
   cleanly) over orange (much error correction) to red (unreadable), on white or laid over the page. They are
-  written even if the file cannot be restored.
+  written even if the file cannot be restored. They show how each picture was printed and scanned: every cell of
+  every picture is read, also after the file is complete, where another picture showed the block already, and where
+  recovery or parity blocks would rebuild it.
+- A cell without dots never reads the block next to it, and a cell between blocks that lost even its grid lines counts
+  as unreadable. The bytes corrected on a page are those of the blocks it gave; 0 for a page as printed.
+- The readings of one picture (as it is, straightened, nudged) are combined cell by cell: a cell is red only if no
+  reading read it, and the unreadable count of `-v` is the number of red cells, the same with or without the pictures.
+  Blocks that read only in a later pass or reading are drawn hatched and counted ("N only with more effort").
 
 ## Scripting
 
