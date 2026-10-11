@@ -1,0 +1,31 @@
+# Codecov settings (https://docs.codecov.com/docs/codecov-yaml). The coverage job in
+# .github/workflows/ci.yml measures `cargo test --workspace` with cargo-llvm-cov and uploads it.
+
+codecov:
+  require_ci_to_pass: true
+
+coverage:
+  precision: 1
+  round: down
+  range: "60...90"
+  status:
+    # The whole project may not drop by more than one point against the base commit.
+    project:
+      default:
+        target: auto
+        threshold: 1%
+    # New and changed lines are reported but do not fail a pull request.
+    patch:
+      default:
+        target: auto
+        informational: true
+
+# Only the library and the command-line tool count; the helper scripts and the test code do not.
+ignore:
+  - "tools/**"
+  - "crates/*/tests/**"
+
+comment:
+  layout: "condensed_header, diff, flags, files"
+  behavior: default
+  require_changes: true

@@ -65,6 +65,28 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # Line and region coverage of the workspace tests, sent to Codecov (settings in codecov.yml). Tags
+  # are left out: the commit was measured when it was pushed to a branch.
+  coverage:
+    name: coverage
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Measure
+        run: cargo llvm-cov --workspace --locked --codecov --output-path codecov.json
+      - uses: codecov/codecov-action@v5
+        with:
+          files: codecov.json
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
   audit:
     name: dependency advisories
     runs-on: ubuntu-latest
