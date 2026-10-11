@@ -6,10 +6,19 @@ even if parts of the paper are damaged.
 
 It is a command-line port, written in Rust, of **PaperBack** by Oleh Yuschuk. It reads and writes the same
 page format, so pages made by the original open here and pages made here open in the original.
-There is no GUI and no scanning or printing code: you feed it files and images, and it gives you files and
-images.
+The CLI tool has no GUI: you feed it files and images, and it gives you files and images. A WebAssembly
+build is also available to run directly in your browser.
 
-Homepage: <https://paperback.j0s.at> - Licence: GPL-3.0-or-later (see [NOTICE.md](NOTICE.md))
+**Web App:** <https://paperback.j0s.at> · **Licence:** GPL-3.0-or-later (see [NOTICE.md](NOTICE.md))
+
+## Web Version (Wasm)
+
+You can encode files and decode scans directly in the browser without installing any software:
+
+**<https://paperback.j0s.at>**
+
+- **Client-side only:** Powered by WebAssembly. Everything runs locally on your machine—no files or images are uploaded to any server.
+- **Source repository:** The web app and Rust/JS Wasm adapter live at [github.com/J0s3f/paperback-homepage](https://github.com/J0s3f/paperback-homepage).
 
 ## Origins
 
@@ -38,6 +47,7 @@ Credits and licences of the parts it builds on are in [NOTICE.md](NOTICE.md).
   recovery block per group of data blocks rebuilds one lost block.
 - Compress with bzip2 before printing.
 - Work in pipelines: standard input and output, quiet on success, clear exit codes.
+- Run entirely in the browser via WebAssembly with zero server-side processing.
 
 ## Install
 
