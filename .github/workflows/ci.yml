@@ -1,7 +1,9 @@
 name: ci
 
 # Runs on every push to a branch and on pull requests; the release workflow calls it
-# before it builds anything.
+# before it builds anything. A pull request from a branch of this repository is tested by the
+# push run of the same commit, so the jobs skip its pull_request run; pull requests from forks
+# have no push run here and are tested.
 on:
   push:
     branches: ["**"]
@@ -14,6 +16,7 @@ env:
 jobs:
   test:
     name: test (${{ matrix.os }})
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -69,7 +72,7 @@ jobs:
   # are left out: the commit was measured when it was pushed to a branch.
   coverage:
     name: coverage
-    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    if: ${{ !startsWith(github.ref, 'refs/tags/') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository) }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -89,6 +92,7 @@ jobs:
 
   audit:
     name: dependency advisories
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
