@@ -603,3 +603,10 @@ cover it was not, and the file stayed incomplete. Now every page that stopped wi
 every attempt and until it lacks nothing, as long as the file is incomplete. The counts of the page in the report are
 then those of that reading. A parity block read in two cells (a grid one cell off) counts once, as in the assembler,
 and a label whose page lies beyond the end of the data is not taken: it carries no block, so it lacked none.
+
+## ttf-parser in the dependency audit
+
+The audit warns that `ttf-parser` is unmaintained. It comes in through `lopdf`, which needs it for its font-embedding helpers
+that this program never calls (the pages use the 8 x 8 pixel font of `font8x8`, drawn as dots, and no font is embedded);
+`lopdf` has no feature to leave it out. It is a warning, not a vulnerability, and it parses nothing we give it. It goes away
+when `lopdf` drops it or when the PDF reader is replaced.
