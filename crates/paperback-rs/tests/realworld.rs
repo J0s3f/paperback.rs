@@ -9,10 +9,12 @@
 // Tests may unwrap: a failure should stop the test with the error.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 use paperback_rs::decode::{DecodeOptions, decode};
 use paperback_rs::imageio::read_pages;
+use sha2::{Digest, Sha256};
 
 const PASSWORD: &str = "paperback-rs-test";
 const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "bmp", "pdf"];
@@ -38,11 +40,15 @@ fn options_for(case: &str) -> DecodeOptions {
 }
 
 fn restore(case: &str, files: &[PathBuf]) -> Vec<u8> {
+    restore_with(&options_for(case), case, files)
+}
+
+fn restore_with(options: &DecodeOptions, case: &str, files: &[PathBuf]) -> Vec<u8> {
     let pages: Vec<_> = files
         .iter()
         .flat_map(|file| read_pages(&std::fs::read(file).unwrap()).unwrap())
         .collect();
-    decode(&pages, &options_for(case), |_| {})
+    decode(&pages, options, |_| {})
         .unwrap_or_else(|error| panic!("{case}: {error}"))
         .data
 }
@@ -89,4 +95,36 @@ fn printed_and_scanned_sheets_decode_to_their_data() {
         checked += 1;
     }
     eprintln!("{checked} case(s) checked against scans");
+}
+
+/// Scans of files that are not kept: `hashes/<case>.sha256` holds the SHA-256 of the data instead.
+/// The pages must carry a hash too, which the decode checks.
+#[test]
+fn scans_without_kept_data_decode_to_their_hash() {
+    let Ok(entries) = std::fs::read_dir(fixtures().join("hashes")) else {
+        return;
+    };
+    for entry in entries {
+        let path = entry.unwrap().path();
+        let case = path.file_stem().unwrap().to_str().unwrap().to_owned();
+        let files = scans_of(&case);
+        if files.is_empty() {
+            eprintln!("no scans for {case}; skipped");
+            continue;
+        }
+        let expected = std::fs::read_to_string(&path).unwrap();
+        // Pages written with extension records (--modern) carry a hash of their own: without it
+        // the decode fails, so the file is checked twice, by the pages and by the hash kept here.
+        let options = DecodeOptions {
+            require_hash: true,
+            ..options_for(&case)
+        };
+        let restored: String = Sha256::digest(restore_with(&options, &case, &files))
+            .iter()
+            .fold(String::new(), |mut hex, byte| {
+                write!(hex, "{byte:02x}").unwrap();
+                hex
+            });
+        assert_eq!(restored, expected.trim(), "{case} from {files:?}");
+    }
 }

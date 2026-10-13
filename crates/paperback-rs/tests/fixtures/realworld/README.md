@@ -43,6 +43,9 @@ depend on it. Do not regenerate them after printing: the scans must match the co
 | d-robust-r2-frame | inkjet print, 600 dpi colour JPEG scan, 150 dpi dots | decodes, but only just: most blocks need 8 to 16 corrected bytes |
 | d-robust-r2-frame | second print, 1200 dpi colour scan stored as 600 dpi gray JPEG | decodes, 970 blocks read |
 | d-robust-r2-frame | same sheet scanned at 300 dpi (2 pixels per dot) | not readable; scan at 600 dpi |
+| h-extended-record | print made with extension records (1.3), 600 dpi colour scan shrunk to a 450 dpi gray JPEG of quality 20 (1.9 MB instead of 5.2; quality 5 or 65% of the size no longer reads); the data is not kept, `hashes/h-extended-record.sha256` holds its SHA-256 | decodes, 878 blocks read, 412 unreadable, rebuilt from the parity |
 | a-laser-600-default | laser print scaled to about 119% by the print dialog | not readable (about 10% of dots wrong); reprint at 100% |
+
+A case without `data/<case>.bin` can be checked by hash: put the SHA-256 of the data into `hashes/<case>.sha256`.
 
 Raw scans that are too large or not yet decodable go in `evaluate/`, which git ignores.
