@@ -16,6 +16,9 @@
 //!   with `-C target-feature=+simd128` (WebAssembly cannot ask the processor, so this is decided
 //!   when the module is built, and a page can offer both builds and pick one with
 //!   `WebAssembly.validate`);
+//! * [`Level::RelaxedSimd`]: as `Simd128` with `i8x16.relaxed_swizzle`, which is one `pshufb` on x86-64
+//!   (and one `tbl` on ARM) where `i8x16.swizzle` needs more instructions to zero the lanes above 15, which
+//!   no nibble is; needs a module built with `-C target-feature=+relaxed-simd`;
 //! * [`Level::Ssse3`]: the same lookups as `pshufb` shuffles, 16 bytes at a time;
 //! * [`Level::Avx2`]: 32 bytes at a time;
 //! * [`Level::Gfni`]: one `gf2p8affineqb` per 32 bytes, which multiplies by a constant of any
@@ -46,6 +49,8 @@ pub enum Level {
     Neon,
     /// 128-bit swizzles (WebAssembly: `simd128`, if the module was built with it).
     Simd128,
+    /// 128-bit relaxed swizzles (WebAssembly: `relaxed-simd`, if the module was built with it).
+    RelaxedSimd,
     /// 128-bit shuffles (x86-64: SSSE3).
     Ssse3,
     /// 256-bit shuffles (x86-64: AVX2).
@@ -55,10 +60,11 @@ pub enum Level {
 }
 
 impl Level {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Scalar,
         Self::Neon,
         Self::Simd128,
+        Self::RelaxedSimd,
         Self::Ssse3,
         Self::Avx2,
         Self::Gfni,
@@ -71,6 +77,7 @@ impl Level {
             Self::Scalar => "scalar",
             Self::Neon => "neon",
             Self::Simd128 => "simd128",
+            Self::RelaxedSimd => "relaxed-simd",
             Self::Ssse3 => "ssse3",
             Self::Avx2 => "avx2",
             Self::Gfni => "gfni",
@@ -85,6 +92,7 @@ impl Level {
             // NEON is part of every 64-bit ARM processor.
             Self::Neon => cfg!(target_arch = "aarch64"),
             Self::Simd128 => cfg!(all(target_arch = "wasm32", target_feature = "simd128")),
+            Self::RelaxedSimd => cfg!(all(target_arch = "wasm32", target_feature = "relaxed-simd")),
             #[cfg(target_arch = "x86_64")]
             Self::Ssse3 => is_x86_feature_detected!("ssse3"),
             #[cfg(target_arch = "x86_64")]
@@ -231,6 +239,8 @@ fn kernel_for(level: Level) -> Kernel {
         Level::Neon => arm::neon,
         #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
         Level::Simd128 => wasm::simd128,
+        #[cfg(all(target_arch = "wasm32", target_feature = "relaxed-simd"))]
+        Level::RelaxedSimd => wasm::relaxed,
         _ => |_, _, _| 0,
     }
 }
@@ -311,7 +321,7 @@ mod arm {
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 mod wasm {
     use std::arch::wasm32::{
-        u8x16_shr, u8x16_splat, u8x16_swizzle, v128_and, v128_load, v128_store, v128_xor,
+        u8x16_shr, u8x16_splat, u8x16_swizzle, v128, v128_and, v128_load, v128_store, v128_xor,
     };
 
     use super::Scale;
@@ -319,10 +329,32 @@ mod wasm {
     /// 16 bytes at a time through two swizzles per vector (a nibble is below 16, so the swizzle
     /// reads the table like `pshufb` does); returns the bytes done.
     pub(super) fn simd128(dst: &mut [u8], scale: &Scale, src: &[u8]) -> usize {
+        multiply(dst, scale, src, |table, indices| {
+            u8x16_swizzle(table, indices)
+        })
+    }
+
+    /// As [`simd128`] with the relaxed swizzle, which gives the same bytes for the indices below 16
+    /// that the nibbles are (only the result for larger ones is up to the engine).
+    #[cfg(target_feature = "relaxed-simd")]
+    pub(super) fn relaxed(dst: &mut [u8], scale: &Scale, src: &[u8]) -> usize {
+        multiply(dst, scale, src, |table, indices| {
+            std::arch::wasm32::i8x16_relaxed_swizzle(table, indices)
+        })
+    }
+
+    #[inline(always)]
+    fn multiply(
+        dst: &mut [u8],
+        scale: &Scale,
+        src: &[u8],
+        swizzle: impl Fn(v128, v128) -> v128,
+    ) -> usize {
         let chunks = src.len() / 16;
-        // SAFETY: the module is built with `simd128`, which is what makes it run only where the
-        // instructions exist. The tables are 16 bytes, and every access is inside the first
-        // `chunks * 16` bytes of `src` and `dst`, which the caller gave the same length.
+        // SAFETY: the module is built with `simd128` (and `relaxed-simd` for the relaxed
+        // swizzle), which is what makes it run only where the instructions exist. The tables are 16
+        // bytes, and every access is inside the first `chunks * 16` bytes of `src` and `dst`, which
+        // the caller gave the same length.
         unsafe {
             let lo = v128_load(scale.lo.as_ptr().cast());
             let hi = v128_load(scale.hi.as_ptr().cast());
@@ -332,7 +364,7 @@ mod wasm {
                 let bytes = v128_load(src.as_ptr().add(at).cast());
                 let low = v128_and(bytes, low_nibbles);
                 let high = u8x16_shr(bytes, 4);
-                let product = v128_xor(u8x16_swizzle(lo, low), u8x16_swizzle(hi, high));
+                let product = v128_xor(swizzle(lo, low), swizzle(hi, high));
                 let target = dst.as_mut_ptr().add(at);
                 v128_store(target.cast(), v128_xor(v128_load(target.cast()), product));
             }
