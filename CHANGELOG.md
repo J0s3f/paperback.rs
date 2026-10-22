@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.3.2
+
+- Faster corner search: the places of a row of the search window are scored together, with the same arithmetic in the same
+  order, so the loops over them are vectorised. The same blocks are read (a test compares the scores bit by bit);
+  about 5% less CPU time on x86-64 and 2% on 64-bit ARM on a set of difficult pictures.
+- Those loops use AVX2 and FMA where the processor has them, chosen when the program runs, so the same executable still
+  runs on older processors. `PAPERBACK_SIMD=scalar` or `ssse3` turns that off, like the vector code of the error correction.
+- WebAssembly: a new level `simd128` (`Level::Simd128`) multiplies in GF(256) with `i8x16.swizzle` in a module built with
+  `-C target-feature=+simd128`, and `relaxed-simd` (`Level::RelaxedSimd`) with `i8x16.relaxed_swizzle` in one built with
+  `+relaxed-simd`. WebAssembly cannot ask the processor, so a page offers the builds and picks one with
+  `WebAssembly.validate`. Error correction takes about half the time with them (6.2 microseconds became 3.3 and 3.1 per call
+  in Node).
+
 ## 1.3.1
 
 - The quality map and overlay draw every block that was read where it was read: through the grid lines it showed, or
