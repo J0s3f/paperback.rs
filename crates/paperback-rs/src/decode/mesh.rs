@@ -7,6 +7,11 @@
 //! the middle and moving outwards, so that each block can be read through its own four
 //! corners.
 
+#![allow(
+    clippy::inline_always,
+    reason = "the loops of a row are to be compiled into the wide variant of `simd::wide`"
+)]
+
 use std::collections::VecDeque;
 
 use rayon::prelude::*;
@@ -747,6 +752,92 @@ impl Arm {
         }
         Some(sum / self.steps.len() as f64)
     }
+
+    /// The places `dx` of row `dy` of a search window where the arm stays inside the bitmap.
+    fn valid_places(&self, bitmap: &Bitmap, dy: isize) -> Option<std::ops::RangeInclusive<isize>> {
+        let (width, height) = (bitmap.width() as isize, bitmap.height() as isize);
+        if self.least.1 + dy < 0 || self.most.1 + dy + 1 >= height {
+            return None;
+        }
+        Some(-self.least.0..=width - 2 - self.most.0)
+    }
+
+    /// [`Arm::ridge`] for the places `first..first + out.len()` of row `dy`, which must all be
+    /// valid. Every place gets the same arithmetic in the same order as in [`Arm::ridge`], so the
+    /// scores are the same bits; the places are the lanes, which are neighbours in memory, so that
+    /// the loops over them are vectorised.
+    #[inline(always)]
+    fn row_scores(
+        &self,
+        bitmap: &Bitmap,
+        dy: isize,
+        first: isize,
+        out: &mut [f64],
+        scratch: &mut [Vec<f64>; 3],
+    ) {
+        let count = out.len();
+        let [line, left, right] = scratch;
+        for buffer in [&mut *line, &mut *left, &mut *right] {
+            buffer.resize(count, 0.0);
+        }
+        out.fill(0.0);
+        let (pixels, width) = (bitmap.pixels(), bitmap.width());
+        for step in &self.steps {
+            for (tap, buffer) in step.iter().zip([&mut *line, &mut *left, &mut *right]) {
+                let at = (tap.y + dy) as usize * width + (tap.x + first) as usize;
+                bilinear_lanes(
+                    &pixels[at..at + count],
+                    &pixels[at + 1..at + 1 + count],
+                    &pixels[at + width..at + width + count],
+                    &pixels[at + width + 1..at + width + 1 + count],
+                    (tap.fx, tap.fy),
+                    buffer,
+                );
+            }
+            sum_step(out, line, left, right);
+        }
+        let steps = self.steps.len() as f64;
+        for sum in out.iter_mut() {
+            *sum /= steps;
+        }
+    }
+}
+
+/// Bilinear interpolation at (`fx`, `fy`) past each of the pixels `p00`, with `p10` to the right
+/// of them, `p01` below and `p11` below that.
+#[inline(always)]
+fn bilinear_lanes(
+    p00: &[u8],
+    p10: &[u8],
+    p01: &[u8],
+    p11: &[u8],
+    (fx, fy): (f64, f64),
+    out: &mut [f64],
+) {
+    let n = out.len();
+    let (p00, p10, p01, p11) = (&p00[..n], &p10[..n], &p01[..n], &p11[..n]);
+    for i in 0..n {
+        let (upper_left, upper_right) = (f64::from(p00[i]), f64::from(p10[i]));
+        let (lower_left, lower_right) = (f64::from(p01[i]), f64::from(p11[i]));
+        let top = upper_left + (upper_right - upper_left) * fx;
+        let bottom = lower_left + (lower_right - lower_left) * fx;
+        out[i] = top + (bottom - top) * fy;
+    }
+}
+
+/// `sum += midpoint(left, right) - line` for every lane (the midpoint of two values in the range of
+/// pixels is their sum halved).
+#[allow(
+    clippy::manual_midpoint,
+    reason = "pixels are far from overflow, and `midpoint` has branches that stop the vectors"
+)]
+#[inline(always)]
+fn sum_step(sum: &mut [f64], line: &[f64], left: &[f64], right: &[f64]) {
+    let n = sum.len();
+    let (line, left, right) = (&line[..n], &left[..n], &right[..n]);
+    for i in 0..n {
+        sum[i] += (left[i] + right[i]) / 2.0 - line[i];
+    }
 }
 
 /// The two arms of a cross at a place, to be moved over the search window.
@@ -797,20 +888,53 @@ fn better_place(a: Option<Place>, b: Option<Place>) -> Option<Place> {
     }
 }
 
-/// Looks at the place (`dx`, `dy`) of the search window and keeps it in `best` if it is better.
-/// The score is the smaller of the two arms, so a place whose horizontal arm is below the best
-/// score so far is dismissed without the vertical one.
-fn consider(best: &mut Option<Place>, cross: &Cross, bitmap: &Bitmap, dx: isize, dy: isize) {
-    let Some(horizontal) = cross.horizontal.ridge(bitmap, dx, dy) else {
-        return;
+/// Looks at every place of row `dy` of the search window and returns the better of `best` and
+/// them. The same as [`consider`] for each place in turn, with the arms worked out for the whole
+/// row at once; the vertical arm only if some place of the row can beat `best` on its horizontal one.
+#[inline(always)]
+fn search_row(
+    cross: &Cross,
+    bitmap: &Bitmap,
+    reach: isize,
+    dy: isize,
+    mut best: Option<Place>,
+) -> Option<Place> {
+    // The places of the row where the arm stays inside the bitmap and the window: (first, last).
+    let places = |arm: &Arm| {
+        arm.valid_places(bitmap, dy)
+            .map(|valid| ((*valid.start()).max(-reach), (*valid.end()).min(reach)))
+            .filter(|(first, last)| first <= last)
     };
-    if best.is_some_and(|(_, _, s)| horizontal < s) {
-        return;
+    let Some((first, last)) = places(&cross.horizontal) else {
+        return best;
+    };
+    let mut scratch = [Vec::new(), Vec::new(), Vec::new()];
+    let mut horizontal = vec![0.0; (last - first + 1) as usize];
+    cross
+        .horizontal
+        .row_scores(bitmap, dy, first, &mut horizontal, &mut scratch);
+    let worth_a_look = |best: Option<Place>, score: f64| !best.is_some_and(|(_, _, s)| score < s);
+    let row_start = best;
+    if !horizontal.iter().any(|&h| worth_a_look(row_start, h)) {
+        return best;
     }
-    let Some(vertical) = cross.vertical.ridge(bitmap, dx, dy) else {
-        return;
-    };
-    *best = better_place(*best, Some((dx, dy, horizontal.min(vertical))));
+    // Without a vertical arm inside the bitmap no place of the row counts: an empty range.
+    let (v_first, v_last) = places(&cross.vertical).unwrap_or((1, 0));
+    let mut vertical = vec![0.0; (v_last - v_first + 1).max(0) as usize];
+    if v_first <= v_last {
+        cross
+            .vertical
+            .row_scores(bitmap, dy, v_first, &mut vertical, &mut scratch);
+    }
+    for dx in first..=last {
+        let h = horizontal[(dx - first) as usize];
+        if (dx, dy) == (0, 0) || !worth_a_look(best, h) || dx < v_first || dx > v_last {
+            continue;
+        }
+        let v = vertical[(dx - v_first) as usize];
+        best = better_place(best, Some((dx, dy, h.min(v))));
+    }
+    best
 }
 
 /// Windows with at least this many rows are searched on several threads when asked to be.
@@ -831,13 +955,11 @@ fn refine(
     // usually scores well, so starting with it lets most of the others be dismissed after
     // the horizontal arm alone.
     let centre: Option<Place> = cross.contrast(bitmap, 0, 0).map(|score| (0, 0, score));
-    let search_row = |dy: isize, mut best: Option<Place>| {
-        for dx in -reach..=reach {
-            if (dx, dy) != (0, 0) {
-                consider(&mut best, &cross, bitmap, dx, dy);
-            }
-        }
-        best
+    let search_row = |dy: isize, best: Option<Place>| {
+        crate::simd::wide(
+            #[inline(always)]
+            || search_row(&cross, bitmap, reach, dy, best),
+        )
     };
     // Rows are independent, and the best of the rows is the best of all: the same place either way.
     let best = if parallel && reach >= PARALLEL_ROWS {
@@ -952,6 +1074,39 @@ mod tests {
             y_peak: offset,
             y_step: step,
             y_angle: 0.0,
+        }
+    }
+
+    #[test]
+    fn the_scores_of_a_row_are_the_bits_of_the_scores_of_its_places() {
+        let bitmap = grid_picture(120, 100, 17, |x, y| {
+            (x * 1.01 + y * 0.02, y * 0.99 - x * 0.01)
+        });
+        let axes = Axes {
+            along_x: (0.998, 0.06),
+            along_y: (-0.06, 0.998),
+        };
+        let cross = Cross::new((60.4, 50.7), axes, 7.0);
+        let mut scratch = [Vec::new(), Vec::new(), Vec::new()];
+        for arm in [&cross.horizontal, &cross.vertical] {
+            for dy in -60..60 {
+                let Some(places) = arm.valid_places(&bitmap, dy) else {
+                    assert!((-140..140).all(|dx| arm.ridge(&bitmap, dx, dy).is_none()));
+                    continue;
+                };
+                let (first, last) = (*places.start(), *places.end());
+                let mut scores = vec![0.0; (last - first + 1) as usize];
+                arm.row_scores(&bitmap, dy, first, &mut scores, &mut scratch);
+                for dx in -140..140 {
+                    let expected = arm.ridge(&bitmap, dx, dy);
+                    if (first..=last).contains(&dx) {
+                        let got = scores[(dx - first) as usize];
+                        assert_eq!(expected.map(f64::to_bits), Some(got.to_bits()), "{dx} {dy}");
+                    } else {
+                        assert!(expected.is_none(), "{dx} {dy}");
+                    }
+                }
+            }
         }
     }
 

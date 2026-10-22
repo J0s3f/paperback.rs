@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Josef H.B. Schneider
 
 //! Multiplying whole rows of bytes in GF(256) with the field polynomial of the on-paper format
-//! (0x187) on the processor's vector units, chosen when the program runs.
+//! (0x187) on the processor's vector units, chosen when the program runs (WebAssembly: when it is built).
 //!
 //! The only operation is `dst ^= c * src` for a constant `c` and equal-length rows, which is
 //! what the error correction spends most of its time on. Five implementations exist and give the
@@ -12,6 +12,10 @@
 //!   processors that have none of the others;
 //! * [`Level::Neon`]: the same lookups as `vqtbl1q_u8` table lookups, 16 bytes at a time, on
 //!   64-bit ARM, where NEON is part of every processor;
+//! * [`Level::Simd128`]: the same lookups as `i8x16.swizzle`, 16 bytes at a time, in WebAssembly built
+//!   with `-C target-feature=+simd128` (WebAssembly cannot ask the processor, so this is decided
+//!   when the module is built, and a page can offer both builds and pick one with
+//!   `WebAssembly.validate`);
 //! * [`Level::Ssse3`]: the same lookups as `pshufb` shuffles, 16 bytes at a time;
 //! * [`Level::Avx2`]: 32 bytes at a time;
 //! * [`Level::Gfni`]: one `gf2p8affineqb` per 32 bytes, which multiplies by a constant of any
@@ -40,6 +44,8 @@ pub enum Level {
     Scalar,
     /// 128-bit table lookups (64-bit ARM: NEON).
     Neon,
+    /// 128-bit swizzles (WebAssembly: `simd128`, if the module was built with it).
+    Simd128,
     /// 128-bit shuffles (x86-64: SSSE3).
     Ssse3,
     /// 256-bit shuffles (x86-64: AVX2).
@@ -49,9 +55,10 @@ pub enum Level {
 }
 
 impl Level {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Scalar,
         Self::Neon,
+        Self::Simd128,
         Self::Ssse3,
         Self::Avx2,
         Self::Gfni,
@@ -63,6 +70,7 @@ impl Level {
         match self {
             Self::Scalar => "scalar",
             Self::Neon => "neon",
+            Self::Simd128 => "simd128",
             Self::Ssse3 => "ssse3",
             Self::Avx2 => "avx2",
             Self::Gfni => "gfni",
@@ -76,6 +84,7 @@ impl Level {
             Self::Scalar => true,
             // NEON is part of every 64-bit ARM processor.
             Self::Neon => cfg!(target_arch = "aarch64"),
+            Self::Simd128 => cfg!(all(target_arch = "wasm32", target_feature = "simd128")),
             #[cfg(target_arch = "x86_64")]
             Self::Ssse3 => is_x86_feature_detected!("ssse3"),
             #[cfg(target_arch = "x86_64")]
@@ -220,6 +229,8 @@ fn kernel_for(level: Level) -> Kernel {
         }
         #[cfg(target_arch = "aarch64")]
         Level::Neon => arm::neon,
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        Level::Simd128 => wasm::simd128,
         _ => |_, _, _| 0,
     }
 }
@@ -297,6 +308,60 @@ mod arm {
     }
 }
 
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+mod wasm {
+    use std::arch::wasm32::{
+        u8x16_shr, u8x16_splat, u8x16_swizzle, v128_and, v128_load, v128_store, v128_xor,
+    };
+
+    use super::Scale;
+
+    /// 16 bytes at a time through two swizzles per vector (a nibble is below 16, so the swizzle
+    /// reads the table like `pshufb` does); returns the bytes done.
+    pub(super) fn simd128(dst: &mut [u8], scale: &Scale, src: &[u8]) -> usize {
+        let chunks = src.len() / 16;
+        // SAFETY: the module is built with `simd128`, which is what makes it run only where the
+        // instructions exist. The tables are 16 bytes, and every access is inside the first
+        // `chunks * 16` bytes of `src` and `dst`, which the caller gave the same length.
+        unsafe {
+            let lo = v128_load(scale.lo.as_ptr().cast());
+            let hi = v128_load(scale.hi.as_ptr().cast());
+            let low_nibbles = u8x16_splat(0x0F);
+            for chunk in 0..chunks {
+                let at = chunk * 16;
+                let bytes = v128_load(src.as_ptr().add(at).cast());
+                let low = v128_and(bytes, low_nibbles);
+                let high = u8x16_shr(bytes, 4);
+                let product = v128_xor(u8x16_swizzle(lo, low), u8x16_swizzle(hi, high));
+                let target = dst.as_mut_ptr().add(at);
+                v128_store(target.cast(), v128_xor(v128_load(target.cast()), product));
+            }
+        }
+        chunks * 16
+    }
+}
+
+/// Runs `work` with the compiler allowed the widest vector instructions of this processor, so
+/// that the loops of the code it inlines are vectorised wider than the baseline of the build
+/// (x86-64: AVX2 and FMA, if [`level`] is [`Level::Avx2`] or better; `PAPERBACK_SIMD` can lower
+/// it). The results do not change: floating-point operations are not fused or reordered.
+/// Only what the closure inlines gets the wider instructions, so it is for a body whose callees are
+/// `#[inline(always)]`. On ARM (NEON) and WebAssembly (`simd128`) the baseline of the build already
+/// is what there is, and `work` runs as it is.
+#[inline]
+pub(crate) fn wide<R>(work: impl FnOnce() -> R) -> R {
+    #[cfg(target_arch = "x86_64")]
+    if level() >= Level::Avx2 {
+        // SAFETY: `level()` is `Avx2` or `Gfni` only after `is_x86_feature_detected!` saw AVX2
+        // (`Gfni` needs it too); FMA is not needed to be seen apart, but is checked below.
+        if is_x86_feature_detected!("fma") {
+            // SAFETY: both features were seen above.
+            return unsafe { x86::wide(work) };
+        }
+    }
+    work()
+}
+
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     #[allow(
@@ -304,6 +369,15 @@ mod x86 {
         reason = "the intrinsics are many and are named alike"
     )]
     use std::arch::x86_64::*;
+
+    /// `work`, compiled with AVX2 and FMA.
+    ///
+    /// # Safety
+    /// The processor must have AVX2 and FMA.
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn wide<R>(work: impl FnOnce() -> R) -> R {
+        work()
+    }
 
     use super::Scale;
 
